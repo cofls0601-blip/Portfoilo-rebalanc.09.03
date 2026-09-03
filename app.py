@@ -48,22 +48,29 @@ def clean_records(df):
         df[c]=pd.to_numeric(df[c],errors='coerce').fillna(0.0)
     if 'prices' not in df: df['prices']=[[] for _ in range(len(df))]
     df['prices']=df['prices'].apply(safe_prices)
-    for c in ['strategy','account','ticker','name','market','role']:
+    for c in ['strategy','account','ticker','name','market','role','signal_ticker']:
         if c not in df: df[c]=''
         df[c]=df[c].fillna('').astype(str)
+    df['signal_ticker']=df.apply(lambda r: r['signal_ticker'] or r['ticker'], axis=1)
     return df
 
 DEFAULT_ROWS=[
  ('LAA','과세 연금저축','133690','TIGER 미국나스닥100','NASDAQ',12.5),('LAA','과세 연금저축','245350','TIGER 유로스탁스배당30','EuroStoxx',12.5),('LAA','과세 연금저축','360750','TIGER 미국S&P500','S&P500',12.5),('LAA','과세 연금저축','251350','KODEX 선진국MSCI World','MSCI World',15.5),('LAA','과세 연금저축','132030','KODEX 골드선물(H)','Gold',25),('LAA','과세 연금저축','148070','KIWOOM 국고채10년','Bond',25),
- ('GSM','비과세 연금저축','360750','TIGER 미국S&P500','GSM 후보',0),('GSM','비과세 연금저축','251350','KODEX 선진국MSCI World','GSM 후보',0),('GSM','비과세 연금저축','133690','TIGER 미국나스닥100','GSM 후보',0),('GSM','비과세 연금저축','245350','TIGER 유로스탁스배당30','GSM 후보',0),('ISA','ISA','133690','TIGER 미국나스닥100','-10% 트리거',0),('SSO','일반계좌 2','360750','TIGER 미국S&P500','S&P500 기준',70),('SSO','일반계좌 2','153130','KODEX 단기채권','현금',30),
+ ('GSM','비과세 연금저축','360750','TIGER 미국S&P500','GSM 후보',0),('GSM','비과세 연금저축','251350','KODEX 선진국MSCI World','GSM 후보',0),('GSM','비과세 연금저축','133690','TIGER 미국나스닥100','GSM 후보',0),('GSM','비과세 연금저축','245350','TIGER 유로스탁스배당30','GSM 후보',0),('ISA','ISA','418660','TIGER 미국나스닥100레버리지(합성)','-10% 트리거',0),('SSO','일반계좌 2','360750','TIGER 미국S&P500','S&P500 기준',70),('SSO','일반계좌 2','153130','KODEX 단기채권','현금',30),
  ('EM','일반계좌 1','069500','KODEX 200','한국',25),('EM','일반계좌 1','','중국 ETF 입력','중국',25),('EM','일반계좌 1','','인도 ETF 입력','인도',25),('EM','일반계좌 1','','베트남 ETF 입력','베트남',25)]
+# ISA는 실제로 레버리지 상품(418660)을 매매하지만, 트리거 판단은 원지수 성격의 나스닥100(133690) 고점대비 하락률로 해야
+# 레버리지 자체의 변동성에 낚이지 않는다. signal_ticker가 신호 판단용 티커, ticker는 실제 매매 티커.
+SIGNAL_TICKER_OVERRIDE = {'418660': '133690'}
 def default_assets():
-    return pd.DataFrame([{'id':str(i),'strategy':a,'account':b,'ticker':c,'name':d,'market':'KR','role':e,'target_pct':f,'shares':0.0,'current_amount':0.0,'close':0.0,'prices':[]} for i,(a,b,c,d,e,f) in enumerate(DEFAULT_ROWS)])
+    rows=[{'id':str(i),'strategy':a,'account':b,'ticker':c,'name':d,'market':'KR','role':e,'target_pct':f,
+           'shares':0.0,'current_amount':0.0,'close':0.0,'prices':[],
+           'signal_ticker':SIGNAL_TICKER_OVERRIDE.get(c,c)} for i,(a,b,c,d,e,f) in enumerate(DEFAULT_ROWS)]
+    return pd.DataFrame(rows)
 
 # ---------- SQLite persistence ----------
 def init_db():
     con=sqlite3.connect(DB_PATH);con.execute('CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT NOT NULL)')
-    for k,v in [('assets',default_assets().to_json(orient='records',force_ascii=False)),('history','[]'),('equity','[]'),('cashflows','[]'),('benchmarks','[]')]: con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)',(k,v))
+    for k,v in [('assets',default_assets().to_json(orient='records',force_ascii=False)),('history','[]'),('equity','[]'),('cashflows','[]'),('benchmarks','[]'),('account_cash',json.dumps({'LAA':0.0,'GSM':0.0,'ISA':0.0}))]: con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)',(k,v))
     con.commit();con.close()
 def get_state(k):
     init_db();con=sqlite3.connect(DB_PATH);r=con.execute('SELECT v FROM kv WHERE k=?',(k,)).fetchone();con.close();return json.loads(r[0])
@@ -125,6 +132,25 @@ def fetch_monthly(source,ticker,day):
         except Exception: pass
     return pd.DataFrame(rows)
 
+@st.cache_data(ttl=3600,show_spinner=False)
+def fetch_daily_recent(source,ticker,day,days=120):
+    # 고점대비 하락률(ISA -10%, SSO -15~-20% 트리거) 계산용 최근 영업일 종가 시리즈.
+    # 월말 데이터(fetch_monthly)만으로는 월중 고점을 놓치므로 별도로 조회한다.
+    end=pd.Timestamp(day);dates=[end-pd.Timedelta(days=i) for i in range(days,-1,-1)]
+    dates=[d for d in dates if d.weekday()<5];rows=[]
+    for d in dates:
+        try:
+            x=fetch_day(source,str(ticker),d.strftime('%Y-%m-%d'));rows.append(x.iloc[-1].to_dict())
+        except Exception: pass
+    return pd.DataFrame(rows)
+
+def drawdown_from_peak(closes):
+    closes=[c for c in closes if n(c)>0]
+    if not closes:return None
+    peak=max(closes);cur=closes[-1]
+    if peak<=0:return None
+    return cur/peak-1
+
 # ---------- calculations ----------
 def calc_prices(a):
     p=safe_prices(a.get('prices',[]),[a.get('close',0)] if n(a.get('close')) else [])
@@ -164,6 +190,18 @@ st.title('자산배분 리밸런싱 도우미');st.caption('한국 상장 ETF ·
 if page=='Action Plan':
     c1,c2,c3=st.columns(3);run_date=c1.date_input('리밸런싱 기준일',date.today());source=c2.selectbox('가격 소스',['krx','data_go'],format_func=lambda x:'KRX Open API' if x=='krx' else '공공데이터포털');strategy=c3.selectbox('저장 전략',['ALL']+STRATEGIES)
     st.info('종가를 불러온 뒤 저장 버튼을 눌렀을 때만 선택일 기준 Action Plan과 히스토리가 생성됩니다.')
+
+    try: account_cash=get_state('account_cash')
+    except Exception: account_cash={'LAA':0.0,'GSM':0.0,'ISA':0.0}
+    with st.expander('계좌별 보유 현금 입력 (매수/매도 금액 계산에 사용)',expanded=False):
+        cc1,cc2,cc3=st.columns(3)
+        laa_cash=cc1.number_input('LAA 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get('LAA',0)))
+        gsm_cash=cc2.number_input('GSM 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get('GSM',0)))
+        isa_cash=cc3.number_input('ISA 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get('ISA',0)))
+        if st.button('현금 잔액 저장'):
+            put_state('account_cash',{'LAA':laa_cash,'GSM':gsm_cash,'ISA':isa_cash});st.success('저장했습니다.');st.rerun()
+    account_cash={'LAA':laa_cash,'GSM':gsm_cash,'ISA':isa_cash}
+
     if st.button('선택일 종가·13개월 월말 데이터 불러오기',type='primary'):
         ok=0;errors=[]
         for i,a in assets.iterrows():
@@ -173,23 +211,103 @@ if page=='Action Plan':
                 daydf=fetch_day(source,t,run_date.isoformat());exact=daydf[daydf['date'].eq(run_date.strftime('%Y%m%d'))];row=exact.iloc[-1] if not exact.empty else daydf.iloc[-1];assets.at[i,'close']=row['close']
                 hist=fetch_monthly(source,t,run_date.isoformat());assets.at[i,'prices']=hist.sort_values('date')['close'].tolist() if not hist.empty else [row['close']];ok+=1
             except Exception as e:errors.append(f'{t}: {e}')
+        # ISA(-10%)·SSO(-15~-20%) 트리거 판정용 최근 영업일 고점대비 하락률 (월말 데이터만으론 월중 고점을 놓침)
+        trigger_dd={}
+        signal_rows=assets[(assets['strategy'].eq('ISA'))|((assets['strategy'].eq('SSO'))&(assets['role'].eq('S&P500 기준')))]
+        for strat,st_ticker in zip(signal_rows['strategy'],signal_rows['signal_ticker']):
+            if not st_ticker:continue
+            try:
+                d=fetch_daily_recent(source,st_ticker,run_date.isoformat(),120)
+                trigger_dd[strat]=drawdown_from_peak(d.sort_values('date')['close'].tolist()) if not d.empty else None
+            except Exception as e:
+                errors.append(f'{st_ticker}(트리거): {e}');trigger_dd[strat]=None
+        st.session_state.trigger_dd=trigger_dd
         st.session_state.assets=assets;put_state('assets',assets.to_dict('records'));st.success(f'{ok}개 종목 반영')
         if errors:st.warning(' / '.join(errors[:5]))
+
+    trigger_dd=st.session_state.get('trigger_dd',{})
     rows=[]
     for i,a in assets.iterrows():
-        close,sma,mom=calc_prices(a);rows.append({'idx':i,'전략':a['strategy'],'티커':a['ticker'],'ETF':a['name'],'종가':close,'SMA10':sma,'SMA 위':'YES' if sma and close>sma else 'NO','12M':mom,'현재금액':asset_value(a),'목표%':a['target_pct']})
+        close,sma,mom=calc_prices(a);rows.append({'idx':i,'전략':a['strategy'],'티커':a['ticker'],'ETF':a['name'],'role':a['role'],'종가':close,'SMA10':sma,'SMA 위':'YES' if sma and close>sma else 'NO','12M':mom,'현재금액':asset_value(a),'목표%':a['target_pct']})
     vdf=pd.DataFrame(rows);st.dataframe(vdf.drop(columns=['idx']),use_container_width=True,hide_index=True)
-    gsm=vdf[(vdf['전략']=='GSM')&(vdf['SMA 위']=='YES')].sort_values('12M',ascending=False);lines=[]
-    if not gsm.empty:
-        g=gsm.iloc[0];tv=vdf[vdf['전략']=='GSM']['현재금액'].sum();lines.append(f'GSM: {g.티커} {g.ETF} 80%({w(tv*.8)}) · 현금 20%({w(tv*.2)}) · 12M {p(g["12M"])}')
-    else:lines.append('GSM: SMA10 위 후보 없음 → 100% 현금')
-    laa=vdf[vdf['전략']=='LAA'];
+
+    QUARTER_END=run_date.month in (3,6,9,12)
+    plan_rows=[]
+
+    # ---- LAA: 나스닥/유로스탁스만 SMA 필터, 필터 이탈분은 현금. 목표비중 복원은 분기말에만 ----
+    laa=vdf[vdf['전략']=='LAA']
     if not laa.empty:
-        nas=laa[laa['전략'].eq('LAA')&laa['티커'].eq('133690')];eur=laa[laa['전략'].eq('LAA')&laa['티커'].eq('245350')];lines.append(f'LAA: NASDAQ {"유지" if not nas.empty and nas.iloc[0]["SMA 위"]=="YES" else "필터 이탈"} · EuroStoxx {"유지" if not eur.empty and eur.iloc[0]["SMA 위"]=="YES" else "필터 이탈"} · 분기말에만 복원')
-    lines += ['ISA: NASDAQ 고점 대비 -10% 트리거 확인 후 분할매수','SSO: S&P500 -15%~-20% 하락 시 현금 절반 투입','신흥국·금: 지정된 조정 시점 외 변경 없음']
-    st.subheader('이번 달 Action Plan');st.markdown('\n'.join('- '+x for x in lines))
+        total=laa['현재금액'].sum()+n(account_cash.get('LAA',0));cash_pct=0.0
+        for _,r in laa.iterrows():
+            filtered=r['티커'] in ('133690','245350');breached=filtered and r['SMA 위']=='NO'
+            if breached:cash_pct+=r['목표%']
+            if QUARTER_END or breached:
+                tgt=0.0 if breached else total*r['목표%']/100
+                note='SMA 이탈 → 현금화' if breached else ('목표비중 복원(분기말)' if QUARTER_END else '유지')
+                plan_rows.append({'전략':'LAA','티커':r['티커'],'ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':tgt,'매매액(+매수/-매도)':tgt-r['현재금액'],'비고':note})
+            else:
+                plan_rows.append({'전략':'LAA','티커':r['티커'],'ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':r['현재금액'],'매매액(+매수/-매도)':0.0,'비고':'유지(분기중)'})
+        cash_tgt=total*cash_pct/100
+        plan_rows.append({'전략':'LAA','티커':'CASH','ETF':'현금','현재금액':n(account_cash.get('LAA',0)),'목표금액':cash_tgt,'매매액(+매수/-매도)':cash_tgt-n(account_cash.get('LAA',0)),'비고':'필터 이탈 자산 보관'})
+
+    # ---- GSM: SMA 통과 후보 중 12M 1위 80%, 현금 20% (없으면 100% 현금) ----
+    gsm=vdf[vdf['전략']=='GSM']
+    if not gsm.empty:
+        total=gsm['현재금액'].sum()+n(account_cash.get('GSM',0))
+        passing=gsm[gsm['SMA 위']=='YES'].sort_values('12M',ascending=False)
+        winner=passing.iloc[0] if not passing.empty else None
+        for _,r in gsm.iterrows():
+            is_winner=winner is not None and r['티커']==winner['티커']
+            tgt=total*0.8 if is_winner else 0.0
+            note='선정(80%)' if is_winner else ('SMA 이탈' if r['SMA 위']=='NO' else '미선정(순위 밀림)')
+            plan_rows.append({'전략':'GSM','티커':r['티커'],'ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':tgt,'매매액(+매수/-매도)':tgt-r['현재금액'],'비고':note})
+        cash_tgt=total*(0.2 if winner is not None else 1.0)
+        plan_rows.append({'전략':'GSM','티커':'CASH','ETF':'현금','현재금액':n(account_cash.get('GSM',0)),'목표금액':cash_tgt,'매매액(+매수/-매도)':cash_tgt-n(account_cash.get('GSM',0)),'비고':'전략 대기현금' if winner is not None else '전 후보 SMA 이탈'})
+
+    # ---- ISA: 나스닥100(신호) 고점대비 -10% → 레버리지(418660) 분할매수 ----
+    isa=vdf[vdf['전략']=='ISA']
+    if not isa.empty:
+        r=isa.iloc[0];dd=trigger_dd.get('ISA');triggered=dd is not None and dd<=-0.10;cash=n(account_cash.get('ISA',0))
+        buy=cash/2 if triggered else 0.0
+        note=f'트리거 발동(신호 고점대비 {p(dd)}) → 현금 절반 분할매수' if triggered else f'대기(신호 고점대비 {p(dd) if dd is not None else "데이터 없음"})'
+        plan_rows.append({'전략':'ISA','티커':r['티커'],'ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':r['현재금액']+buy,'매매액(+매수/-매도)':buy,'비고':note})
+        plan_rows.append({'전략':'ISA','티커':'CASH','ETF':'현금','현재금액':cash,'목표금액':cash-buy,'매매액(+매수/-매도)':-buy,'비고':'매수 재원'})
+
+    # ---- SSO: S&P500(360750) 자체 고점대비 -15%↓ → 현금(153130) 절반을 주식으로 ----
+    sso=vdf[vdf['전략']=='SSO']
+    if not sso.empty:
+        total=sso['현재금액'].sum();dd=trigger_dd.get('SSO');triggered=dd is not None and dd<=-0.15
+        stock_pct=85.0 if triggered else 70.0
+        for _,r in sso.iterrows():
+            is_stock=r['티커']=='360750';tgt=total*(stock_pct if is_stock else 100-stock_pct)/100
+            note=(f'트리거 발동(고점대비 {p(dd)}) → 현금 절반 투입' if triggered else f'평시 유지(고점대비 {p(dd) if dd is not None else "데이터 없음"})') if is_stock else ('트리거 발동 → 현금 축소' if triggered else '평시 유지')
+            plan_rows.append({'전략':'SSO','티커':r['티커'],'ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':tgt,'매매액(+매수/-매도)':tgt-r['현재금액'],'비고':note})
+
+    # ---- EM/금/별도현금: 리밸런싱 대상 아님 ----
+    em=vdf[vdf['전략']=='EM']
+    if not em.empty:
+        for _,r in em.iterrows():
+            plan_rows.append({'전략':'EM','티커':r['티커'] or '-','ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':r['현재금액'],'매매액(+매수/-매도)':0.0,'비고':'매매 없음(연 1회만 허용)'})
+
+    plan_df=pd.DataFrame(plan_rows)
+    st.subheader('이번 달 Action Plan (매수/매도 금액)')
+    if plan_df.empty:
+        st.warning('종목 데이터를 먼저 불러오세요.')
+    else:
+        show=plan_df.copy()
+        for c in ['현재금액','목표금액','매매액(+매수/-매도)']:show[c]=show[c].map(w)
+        st.dataframe(show,use_container_width=True,hide_index=True)
+        for strat,g in plan_df.groupby('전략'):
+            buys=g[g['매매액(+매수/-매도)']>1000];sells=g[g['매매액(+매수/-매도)']<-1000]
+            parts=[]
+            if not buys.empty:parts.append('매수: '+', '.join(f"{x.ETF} {w(x['매매액(+매수/-매도)'])}" for _,x in buys.iterrows()))
+            if not sells.empty:parts.append('매도: '+', '.join(f"{x.ETF} {w(-x['매매액(+매수/-매도)'])}" for _,x in sells.iterrows()))
+            st.markdown(f"**{strat}** — "+(' · '.join(parts) if parts else '거래 없음'))
+
     if st.button('Action Plan 생성·히스토리 저장'):
-        value=float(vdf[vdf['전략'].eq(strategy) if strategy!='ALL' else vdf['전략'].notna()]['현재금액'].sum());eq=get_state('equity');cf=get_state('cashflows');m=portfolio_perf(eq);irr=calc_xirr(eq,cf);h=get_state('history');h.insert(0,{'date':run_date.isoformat(),'strategy':strategy,'value':value,'plan':' | '.join(lines),'CAGR':m[0] if m else None,'MDD':m[1] if m else None,'IRR':irr});put_state('history',h);st.success('저장했습니다.')
+        value=float(vdf[vdf['전략'].eq(strategy) if strategy!='ALL' else vdf['전략'].notna()]['현재금액'].sum());eq=get_state('equity');cf=get_state('cashflows');m=portfolio_perf(eq);irr=calc_xirr(eq,cf);h=get_state('history')
+        plan_text=' | '.join(f"{r['전략']} {r['ETF']}: {w(r['매매액(+매수/-매도)'])} ({r['비고']})" for _,r in plan_df.iterrows() if abs(r['매매액(+매수/-매도)'])>1000) if not plan_df.empty else ''
+        h.insert(0,{'date':run_date.isoformat(),'strategy':strategy,'value':value,'plan':plan_text,'CAGR':m[0] if m else None,'MDD':m[1] if m else None,'IRR':irr});put_state('history',h);st.success('저장했습니다.')
 
 elif page=='전략 구성':
     st.subheader('전략별 ETF 구성');st.caption('전략을 활성화한 뒤 해당 전략의 ETF만 편집합니다. ETF 검색은 런타임 KRX 목록을 우선 사용하고 실패 시 번들 CSV를 사용합니다.')
