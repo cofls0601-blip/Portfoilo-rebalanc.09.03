@@ -9,7 +9,6 @@ import streamlit as st
 st.set_page_config(page_title='자산배분 리밸런싱 도우미', page_icon='📊', layout='wide')
 ROOT = Path(__file__).parent
 DB_PATH = st.secrets.get('SQLITE_PATH', str(ROOT / 'portfolio.db'))
-STRATEGIES = ['LAA', 'GSM', 'ISA', 'SSO', 'EM']
 
 # ---------- Safe data normalization ----------
 def safe_prices(value, fallback=None):
@@ -67,10 +66,19 @@ def default_assets():
            'signal_ticker':SIGNAL_TICKER_OVERRIDE.get(c,c)} for i,(a,b,c,d,e,f) in enumerate(DEFAULT_ROWS)]
     return pd.DataFrame(rows)
 
+DEFAULT_STRATEGIES = [
+    {'code': 'LAA', 'account': '과세 연금저축', 'dynamic': False, 'cash_pct': 0.0},
+    {'code': 'GSM', 'account': '비과세 연금저축', 'dynamic': True, 'cash_pct': 20.0},
+    {'code': 'ISA', 'account': 'ISA', 'dynamic': False, 'cash_pct': 100.0},
+    {'code': 'SSO', 'account': '일반계좌 2', 'dynamic': False, 'cash_pct': 0.0},
+    {'code': 'EM', 'account': '일반계좌 1', 'dynamic': False, 'cash_pct': 0.0},
+]
+KNOWN_STRATEGIES = {'LAA', 'GSM', 'ISA', 'SSO', 'EM'}  # 전용 리밸런싱 규칙이 있는 전략(하드코딩된 룰)
+
 # ---------- SQLite persistence ----------
 def init_db():
     con=sqlite3.connect(DB_PATH);con.execute('CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT NOT NULL)')
-    for k,v in [('assets',default_assets().to_json(orient='records',force_ascii=False)),('history','[]'),('equity','[]'),('cashflows','[]'),('benchmarks','[]'),('account_cash',json.dumps({'LAA':0.0,'GSM':0.0,'ISA':0.0}))]: con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)',(k,v))
+    for k,v in [('assets',default_assets().to_json(orient='records',force_ascii=False)),('history','[]'),('equity','[]'),('cashflows','[]'),('benchmarks','[]'),('account_cash',json.dumps({'LAA':0.0,'GSM':0.0,'ISA':0.0})),('strategies',json.dumps(DEFAULT_STRATEGIES,ensure_ascii=False))]: con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)',(k,v))
     con.commit();con.close()
 def get_state(k):
     init_db();con=sqlite3.connect(DB_PATH);r=con.execute('SELECT v FROM kv WHERE k=?',(k,)).fetchone();con.close();return json.loads(r[0])
@@ -180,27 +188,68 @@ def calc_xirr(equity,cashflows):
 def w(x):return f'{n(x):,.0f}원'
 def p(x):return f'{x*100:.2f}%'
 
+# ---------- 전략 레지스트리 ----------
+def get_strategies():
+    try:
+        s=get_state('strategies')
+        return s if s else DEFAULT_STRATEGIES
+    except Exception:
+        return DEFAULT_STRATEGIES
+
+def strategy_codes():
+    return [c['code'] for c in get_strategies()]
+
+def validate_strategy_weights(rows_df, cfg):
+    """자산 목표비중 합 + 현금비중 = 100%인지 검사. dynamic 전략(GSM 등)은 검사하지 않음."""
+    if cfg.get('dynamic'):
+        return True, None
+    asset_sum = pd.to_numeric(rows_df['target_pct'], errors='coerce').fillna(0.0).sum()
+    total = asset_sum + n(cfg.get('cash_pct', 0))
+    if abs(total - 100) > 0.05:
+        return False, f"자산 목표비중 합({asset_sum:.1f}%) + 현금비중({n(cfg.get('cash_pct',0)):.1f}%) = {total:.1f}% — 100%가 되어야 저장할 수 있습니다."
+    return True, None
+
+def compute_portfolio_snapshot(assets_df):
+    """전략별 현재 보유금액(자산+현금)을 합산해 총자산 스냅샷을 만든다. 수동 총자산 입력을 대체."""
+    cfgs=get_strategies();account_cash=get_state('account_cash');rows=[];grand=0.0
+    for cfg in cfgs:
+        code=cfg['code'];sub=assets_df[assets_df['strategy'].eq(code)]
+        cash=n(account_cash.get(code,0))
+        asset_sum=sub.apply(asset_value,axis=1).sum() if not sub.empty else 0.0
+        total=asset_sum+cash;grand+=total
+        for _,r in sub.iterrows():
+            val=asset_value(r)
+            rows.append({'전략':code,'계좌':cfg.get('account',code),'ETF':r['name'] or r['ticker'] or '-','현재금액':val,
+                         '현재비중':(val/total*100 if total>0 else 0.0),'목표비중':n(r['target_pct'])})
+        rows.append({'전략':code,'계좌':cfg.get('account',code),'ETF':'현금','현재금액':cash,
+                     '현재비중':(cash/total*100 if total>0 else 0.0),'목표비중':n(cfg.get('cash_pct',0))})
+    return grand, pd.DataFrame(rows), cfgs
+
 # ---------- app ----------
 if 'assets' not in st.session_state:st.session_state.assets=clean_records(pd.DataFrame(get_state('assets')))
 assets=clean_records(st.session_state.assets)
 with st.sidebar:
-    st.markdown('## 📊 자산배분 도우미');page=st.radio('메뉴',['Action Plan','전략 구성','성과 비교','리밸런싱 히스토리']);st.caption('자동주문 없음 · 지정일 실행만 저장')
+    st.markdown('## 📊 자산배분 도우미');page=st.radio('메뉴',['Action Plan','포트폴리오 대시보드','전략 구성','성과 비교','리밸런싱 히스토리']);st.caption('자동주문 없음 · 지정일 실행만 저장')
 st.title('자산배분 리밸런싱 도우미');st.caption('한국 상장 ETF · 10개월 SMA · 12개월 모멘텀 · CAGR/MDD/IRR')
 
 if page=='Action Plan':
-    c1,c2,c3=st.columns(3);run_date=c1.date_input('리밸런싱 기준일',date.today());source=c2.selectbox('가격 소스',['krx','data_go'],format_func=lambda x:'KRX Open API' if x=='krx' else '공공데이터포털');strategy=c3.selectbox('저장 전략',['ALL']+STRATEGIES)
+    codes=strategy_codes();cfgs=get_strategies()
+    c1,c2,c3=st.columns(3);run_date=c1.date_input('리밸런싱 기준일',date.today());source=c2.selectbox('가격 소스',['krx','data_go'],format_func=lambda x:'KRX Open API' if x=='krx' else '공공데이터포털');strategy=c3.selectbox('저장 전략',['ALL']+codes)
     st.info('종가를 불러온 뒤 저장 버튼을 눌렀을 때만 선택일 기준 Action Plan과 히스토리가 생성됩니다.')
 
     try: account_cash=get_state('account_cash')
-    except Exception: account_cash={'LAA':0.0,'GSM':0.0,'ISA':0.0}
-    with st.expander('계좌별 보유 현금 입력 (매수/매도 금액 계산에 사용)',expanded=False):
-        cc1,cc2,cc3=st.columns(3)
-        laa_cash=cc1.number_input('LAA 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get('LAA',0)))
-        gsm_cash=cc2.number_input('GSM 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get('GSM',0)))
-        isa_cash=cc3.number_input('ISA 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get('ISA',0)))
+    except Exception: account_cash={}
+    with st.expander('전략별 보유 현금 입력 (매수/매도 금액 계산에 사용)',expanded=False):
+        st.caption('이미 계좌 내 단기채권 등 별도 ETF로 현금성 자산을 잡아둔 전략(SSO 등)은 0으로 두세요.')
+        new_cash={}
+        cols=st.columns(min(3,len(cfgs)) or 1)
+        for i,cfg in enumerate(cfgs):
+            code=cfg['code']
+            with cols[i%len(cols)]:
+                new_cash[code]=st.number_input(f'{code} 현금(원)',min_value=0.0,step=10000.0,value=n(account_cash.get(code,0)),key=f'cash_{code}')
         if st.button('현금 잔액 저장'):
-            put_state('account_cash',{'LAA':laa_cash,'GSM':gsm_cash,'ISA':isa_cash});st.success('저장했습니다.');st.rerun()
-    account_cash={'LAA':laa_cash,'GSM':gsm_cash,'ISA':isa_cash}
+            put_state('account_cash',new_cash);st.success('저장했습니다.');st.rerun()
+    account_cash={**account_cash,**new_cash}
 
     if st.button('선택일 종가·13개월 월말 데이터 불러오기',type='primary'):
         ok=0;errors=[]
@@ -289,6 +338,19 @@ if page=='Action Plan':
         for _,r in em.iterrows():
             plan_rows.append({'전략':'EM','티커':r['티커'] or '-','ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':r['현재금액'],'매매액(+매수/-매도)':0.0,'비고':'매매 없음(연 1회만 허용)'})
 
+    # ---- 사용자 추가 전략: 전용 규칙이 없으므로 목표비중(자산+현금) 그대로 복원하는 정적 리밸런싱 적용 ----
+    for cfg in cfgs:
+        code=cfg['code']
+        if code in KNOWN_STRATEGIES: continue
+        sub=vdf[vdf['전략']==code]
+        if sub.empty: continue
+        cash=n(account_cash.get(code,0));total=sub['현재금액'].sum()+cash
+        for _,r in sub.iterrows():
+            tgt=total*n(r['목표%'])/100
+            plan_rows.append({'전략':code,'티커':r['티커'],'ETF':r['ETF'],'현재금액':r['현재금액'],'목표금액':tgt,'매매액(+매수/-매도)':tgt-r['현재금액'],'비고':'목표비중 리밸런싱'})
+        cash_tgt=total*n(cfg.get('cash_pct',0))/100
+        plan_rows.append({'전략':code,'티커':'CASH','ETF':'현금','현재금액':cash,'목표금액':cash_tgt,'매매액(+매수/-매도)':cash_tgt-cash,'비고':'현금 목표비중'})
+
     plan_df=pd.DataFrame(plan_rows)
     st.subheader('이번 달 Action Plan (매수/매도 금액)')
     if plan_df.empty:
@@ -309,21 +371,100 @@ if page=='Action Plan':
         plan_text=' | '.join(f"{r['전략']} {r['ETF']}: {w(r['매매액(+매수/-매도)'])} ({r['비고']})" for _,r in plan_df.iterrows() if abs(r['매매액(+매수/-매도)'])>1000) if not plan_df.empty else ''
         h.insert(0,{'date':run_date.isoformat(),'strategy':strategy,'value':value,'plan':plan_text,'CAGR':m[0] if m else None,'MDD':m[1] if m else None,'IRR':irr});put_state('history',h);st.success('저장했습니다.')
 
+elif page=='포트폴리오 대시보드':
+    st.subheader('포트폴리오 대시보드');st.caption('전략(계좌)별 목표비중 대비 현재비중을 한눈에 봅니다 · Snowball72 스타일 참고')
+    grand_total, snap_df, cfgs = compute_portfolio_snapshot(assets)
+    st.metric('전체 총자산 (모든 전략 합계)', w(grand_total))
+    if snap_df.empty:
+        st.info('전략과 ETF를 먼저 구성하세요.')
+    else:
+        for cfg in cfgs:
+            code=cfg['code'];g=snap_df[snap_df['전략']==code]
+            if g.empty:continue
+            strat_total=g['현재금액'].sum()
+            badge=' · 동적(모멘텀)' if cfg.get('dynamic') else ''
+            st.markdown(f"#### {code} · {cfg.get('account',code)}{badge} — {w(strat_total)}")
+            show=g[['ETF','현재금액','현재비중','목표비중']].copy()
+            st.dataframe(show,use_container_width=True,hide_index=True,column_config={
+                '현재금액':st.column_config.NumberColumn('현재금액',format='%d원'),
+                '현재비중':st.column_config.ProgressColumn('현재비중',format='%.1f%%',min_value=0,max_value=100),
+                '목표비중':st.column_config.NumberColumn('목표비중(%)',format='%.1f%%'),
+            })
+        st.divider();st.markdown('#### 전략별 비중 (전체 자산 대비)')
+        by_strategy=snap_df.groupby('전략')['현재금액'].sum()
+        if grand_total>0:
+            st.bar_chart((by_strategy/grand_total*100).rename('비중(%)'))
+
 elif page=='전략 구성':
     st.subheader('전략별 ETF 구성');st.caption('전략을 활성화한 뒤 해당 전략의 ETF만 편집합니다. ETF 검색은 런타임 KRX 목록을 우선 사용하고 실패 시 번들 CSV를 사용합니다.')
-    active={s:st.checkbox(f'{s} 활성화',value=True,key=f'act_{s}') for s in STRATEGIES};chosen=st.selectbox('편집할 전략',[s for s in STRATEGIES if active[s]] or STRATEGIES)
+    cfgs=get_strategies();codes=[c['code'] for c in cfgs]
+
+    with st.expander('➕ 새 전략 추가'):
+        nc1,nc2,nc3,nc4=st.columns([1,2,1,1])
+        new_code=nc1.text_input('전략 코드',placeholder='예: CORE2')
+        new_account=nc2.text_input('계좌명',placeholder='예: 개인연금')
+        new_dynamic=nc3.checkbox('동적(모멘텀 선택형)',value=False,help='GSM처럼 매달 후보 중 하나를 골라 투자하는 방식이면 체크. 체크하면 100% 합계 검사를 하지 않습니다.')
+        new_cash_pct=nc4.number_input('현금비중(%)',min_value=0.0,max_value=100.0,value=0.0,step=1.0)
+        if st.button('전략 추가'):
+            code_clean=new_code.strip().upper()
+            if not code_clean:
+                st.error('전략 코드를 입력하세요.')
+            elif code_clean in codes:
+                st.error('이미 존재하는 전략 코드입니다.')
+            else:
+                cfgs.append({'code':code_clean,'account':new_account.strip() or code_clean,'dynamic':new_dynamic,'cash_pct':new_cash_pct})
+                put_state('strategies',cfgs);st.success(f'{code_clean} 전략을 추가했습니다.');st.rerun()
+
+    active={s:st.checkbox(f'{s} 활성화',value=True,key=f'act_{s}') for s in codes};chosen=st.selectbox('편집할 전략',[s for s in codes if active[s]] or codes)
+    chosen_cfg=next((c for c in cfgs if c['code']==chosen),{'code':chosen,'account':chosen,'dynamic':False,'cash_pct':0.0})
+
+    cc1,cc2,cc3=st.columns(3)
+    edit_account=cc1.text_input('계좌명',value=chosen_cfg.get('account',chosen))
+    edit_dynamic=cc2.checkbox('동적(모멘텀 선택형)',value=chosen_cfg.get('dynamic',False),key=f'dyn_{chosen}')
+    edit_cash_pct=cc3.number_input('현금 목표비중(%)',min_value=0.0,max_value=100.0,value=n(chosen_cfg.get('cash_pct',0)),step=0.5,key=f'cashpct_{chosen}')
+
     subset=assets[assets['strategy'].eq(chosen)].copy();edited=st.data_editor(subset, num_rows='dynamic',use_container_width=True,hide_index=True,column_config={'target_pct':st.column_config.NumberColumn('목표%',min_value=0,max_value=100,step=0.1),'shares':st.column_config.NumberColumn('보유수량',step=0.0001),'current_amount':st.column_config.NumberColumn('현재금액',step=1000),'close':st.column_config.NumberColumn('종가',step=0.01)})
+
+    asset_sum=pd.to_numeric(edited['target_pct'],errors='coerce').fillna(0.0).sum()
+    if edit_dynamic:
+        st.caption(f'동적 전략: 자산 목표% 합계는 검사하지 않습니다 (현재 {asset_sum:.1f}%). 현금비중 {edit_cash_pct:.1f}%는 평시(트리거 미발동) 기준값으로만 사용됩니다.')
+    else:
+        total_check=asset_sum+edit_cash_pct
+        if abs(total_check-100)>0.05:
+            st.error(f'자산 목표비중 합({asset_sum:.1f}%) + 현금비중({edit_cash_pct:.1f}%) = {total_check:.1f}% — 100%가 되어야 저장됩니다.')
+        else:
+            st.success(f'자산 목표비중 합({asset_sum:.1f}%) + 현금비중({edit_cash_pct:.1f}%) = 100% ✓')
+
     st.markdown('### ETF 검색·추가');q=st.text_input('티커 또는 상품명 일부 입력');catalog=load_krx_etfs(date.today().isoformat());filtered=catalog[catalog['ticker'].str.contains(q,case=False,na=False)|catalog['name'].str.contains(q,case=False,na=False)] if q else catalog.head(100);opts=['선택 안 함']+[f'{r.ticker} · {r.name}' for _,r in filtered.head(200).iterrows()];picked=st.selectbox('KRX ETF 선택',opts)
     if st.button('선택 ETF를 전략에 추가') and picked!='선택 안 함':
-        t,nm=picked.split(' · ',1);assets.loc[len(assets)]={'id':str(len(assets)+1),'strategy':chosen,'account':chosen,'ticker':t,'name':nm,'market':'KR','role':'사용자 추가','target_pct':0.0,'shares':0.0,'current_amount':0.0,'close':0.0,'prices':[]};st.session_state.assets=assets;put_state('assets',assets.to_dict('records'));st.success(f'{t}를 {chosen}에 추가했습니다.');st.rerun()
+        t,nm=picked.split(' · ',1);assets.loc[len(assets)]={'id':str(len(assets)+1),'strategy':chosen,'account':chosen,'ticker':t,'name':nm,'market':'KR','role':'사용자 추가','target_pct':0.0,'shares':0.0,'current_amount':0.0,'close':0.0,'prices':[],'signal_ticker':t};st.session_state.assets=assets;put_state('assets',assets.to_dict('records'));st.success(f'{t}를 {chosen}에 추가했습니다.');st.rerun()
+
     if st.button('선택 전략 저장',type='primary'):
-        assets=assets[~assets['strategy'].eq(chosen)].copy();edited=clean_records(edited);edited['strategy']=chosen;assets=pd.concat([assets,edited],ignore_index=True);st.session_state.assets=assets;put_state('assets',assets.to_dict('records'));st.success('저장했습니다.')
+        edited_clean=clean_records(edited)
+        ok,msg=validate_strategy_weights(edited_clean,{'dynamic':edit_dynamic,'cash_pct':edit_cash_pct})
+        if not ok:
+            st.error(msg)
+        else:
+            assets2=assets[~assets['strategy'].eq(chosen)].copy();edited_clean['strategy']=chosen;assets2=pd.concat([assets2,edited_clean],ignore_index=True)
+            st.session_state.assets=assets2;put_state('assets',assets2.to_dict('records'))
+            new_cfgs=[c for c in cfgs if c['code']!=chosen]+[{'code':chosen,'account':edit_account.strip() or chosen,'dynamic':edit_dynamic,'cash_pct':edit_cash_pct}]
+            put_state('strategies',new_cfgs)
+            st.success('저장했습니다.');st.rerun()
     st.info(f'KRX 목록: {len(catalog):,}개 · 목록 출처: pykrx 런타임 조회, 실패 시 krx_etf_fallback.csv')
 
 elif page=='성과 비교':
-    st.subheader('월말 총자산·성과');d=st.date_input('월말 기준일',date.today(),key='eqd');v=st.number_input('총자산(원)',min_value=0.0,step=100000.0,key='eqv')
-    if st.button('월말 자산 저장',type='primary'):
-        e=[x for x in get_state('equity') if x['date']!=d.isoformat()];e.append({'date':d.isoformat(),'value':v});put_state('equity',e);st.success('저장했습니다.')
+    st.subheader('월말 총자산 (전략별 자동 합산)');st.caption('각 전략의 현재금액+현금을 자동으로 합산합니다. 아래에서 확인 후 히스토리에 반영하세요.')
+    grand_total, snap_df, _ = compute_portfolio_snapshot(assets)
+    st.metric('현재 계산된 총자산', w(grand_total))
+    with st.expander('전략별 세부 내역 보기'):
+        if snap_df.empty:
+            st.info('전략과 ETF를 먼저 구성하세요.')
+        else:
+            show=snap_df.copy();show['현재금액']=show['현재금액'].map(w);show['현재비중']=show['현재비중'].map(lambda x:f'{x:.1f}%');show['목표비중']=show['목표비중'].map(lambda x:f'{x:.1f}%')
+            st.dataframe(show,use_container_width=True,hide_index=True)
+    d=st.date_input('반영할 날짜',date.today(),key='eqd')
+    if st.button('이번 총자산을 히스토리에 반영',type='primary'):
+        e=[x for x in get_state('equity') if x['date']!=d.isoformat()];e.append({'date':d.isoformat(),'value':grand_total});put_state('equity',e);st.success('반영했습니다.')
     e=get_state('equity');cf=get_state('cashflows');m=portfolio_perf(e);irr=calc_xirr(e,cf);a,b,c=st.columns(3);a.metric('CAGR',p(m[0]) if m else '—');b.metric('MDD',p(m[1]) if m else '—');c.metric('IRR/XIRR',p(irr) if irr is not None else '—')
     if e:st.line_chart(pd.DataFrame(e).assign(date=lambda x:pd.to_datetime(x.date)).set_index('date')['value'])
     st.divider();st.subheader('벤치마크 입력·동일 기간 누적 비교');st.caption('내 첫 월말 자산 기록일을 시작점으로 100에 정규화합니다. QQQ·SPY·KOSPI200도 같은 기간만 사용합니다.')
