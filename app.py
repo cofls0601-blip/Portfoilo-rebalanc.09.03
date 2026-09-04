@@ -120,6 +120,7 @@ def init_db():
         ('assets', default_assets().to_json(orient='records', force_ascii=False)),
         ('history', '[]'), ('equity', '[]'), ('cashflows', '[]'), ('benchmarks', '[]'),
         ('strategies', json.dumps(DEFAULT_STRATEGIES, ensure_ascii=False)),
+        ('category_targets', json.dumps({c: 0.0 for c in CATEGORY_OPTIONS}, ensure_ascii=False)),
     ]:
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)', (k, v))
     con.commit(); con.close()
@@ -215,14 +216,25 @@ def fetch_day(source, ticker, day):
     if hit.empty: raise RuntimeError(f'{ticker}: 해당 일자 데이터에서 종목코드를 찾지 못함')
     return hit
 
+def find_trading_day_price(source, ticker, target_date, max_back=10):
+    """target_date가 휴장일(주말·공휴일)이면 하루씩 앞으로 물러나며 실제 거래일 종가를 찾는다."""
+    d = pd.Timestamp(target_date)
+    for _ in range(max_back):
+        try:
+            x = fetch_day(source, str(ticker), d.strftime('%Y-%m-%d'))
+            return x.iloc[-1].to_dict()
+        except Exception:
+            d -= pd.Timedelta(days=1)
+    return None
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_monthly(source, ticker, day):
+    # 월말 날짜가 정확히 휴장일이면(전체 달의 ~30%가 주말) 종전 로직은 그 달을 통째로 건너뛰어
+    # prices가 10개월 미만으로 남는 경우가 잦았고, 그 결과 SMA가 0으로 계산되는 버그가 있었다.
     dates = pd.date_range(end=pd.Timestamp(day), periods=13, freq='ME'); rows = []
     for d in dates:
-        try:
-            x = fetch_day(source, str(ticker), d.strftime('%Y-%m-%d')); rows.append(x.iloc[-1].to_dict())
-        except Exception:
-            pass
+        row = find_trading_day_price(source, ticker, d)
+        if row: rows.append(row)
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -284,8 +296,10 @@ def drawdown_from_peak(closes):
 def calc_prices(a):
     prices = safe_prices(a.get('prices', []), [a.get('close', 0)] if n(a.get('close')) else [])
     close = n(a.get('close')) or (prices[-1] if prices else 0)
-    sma = sum(prices[-10:]) / 10 if len(prices) >= 10 else 0
-    mom = prices[-1] / prices[-13] - 1 if len(prices) >= 13 and prices[-13] else 0
+    # sma/mom을 0으로 반환하면 "0은 falsy"라 'sma and close > sma' 같은 검사가 늘 False가 되어
+    # 데이터 부족 상황이 "SMA 하회"로 둔갑하는 버그가 생긴다. 계산 불가 시 None을 반환해 명확히 구분한다.
+    sma = sum(prices[-10:]) / 10 if len(prices) >= 10 else None
+    mom = (prices[-1] / prices[-13] - 1) if len(prices) >= 13 and prices[-13] else None
     return close, sma, mom
 
 def asset_value(a):
@@ -374,6 +388,45 @@ def save_history_snapshot(assets_df, run_date, plan_text=None):
     put_state('equity', e)
     return grand
 
+def get_category_targets():
+    try:
+        t = get_state('category_targets')
+        return {**{c: 0.0 for c in CATEGORY_OPTIONS}, **t}
+    except Exception:
+        return {c: 0.0 for c in CATEGORY_OPTIONS}
+
+def last_snapshot_info():
+    """가장 최근 저장된 히스토리 날짜와 오늘까지 경과일수."""
+    h = get_state('history')
+    if not h: return None
+    last_date = sorted(h, key=lambda x: x['date'])[-1]['date']
+    days = (date.today() - pd.Timestamp(last_date).date()).days
+    return last_date, days
+
+def compute_mom_delta():
+    """가장 최근 두 번의 히스토리 저장을 비교해 총자산/전략별/분류별 증감을 계산."""
+    h = get_state('history')
+    if len(h) < 2: return None
+    hs = sorted(h, key=lambda x: x['date'])
+    cur, prev = hs[-1], hs[-2]
+    def diff_rows(a, b):
+        keys = sorted(set(a.keys()) | set(b.keys()))
+        return [{'항목': k, '이번': n(a.get(k, 0)), '저번': n(b.get(k, 0)), '증감': n(a.get(k, 0)) - n(b.get(k, 0))} for k in keys]
+    return {
+        'cur_date': cur['date'], 'prev_date': prev['date'],
+        'total_cur': n(cur.get('total')), 'total_prev': n(prev.get('total')),
+        'total_delta': n(cur.get('total')) - n(prev.get('total')),
+        'by_strategy': diff_rows(cur.get('by_strategy') or {}, prev.get('by_strategy') or {}),
+        'by_category': diff_rows(cur.get('by_category') or {}, prev.get('by_category') or {}),
+    }
+
+def render_diff_table(rows):
+    if not rows: return
+    df = pd.DataFrame(rows)
+    show = df.copy()
+    for c in ['이번', '저번', '증감']: show[c] = show[c].map(w)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
 def ensure_cash_rows(assets_df):
     """구버전 DB(계좌별 현금을 별도 kv로 관리하던 시절) 호환: 전략에 CASH 행이 없으면 만들어준다."""
     cfgs = get_strategies()
@@ -404,6 +457,15 @@ with st.sidebar:
 st.title('자산배분 리밸런싱 도우미'); st.caption('한국/미국 상장 종목 · 10개월 SMA · 12개월 모멘텀 · CAGR/MDD/IRR')
 
 if page == 'Action Plan':
+    info = last_snapshot_info()
+    if info:
+        last_date, days = info
+        if days >= 25:
+            st.warning(f'마지막 히스토리 저장: {last_date} ({days}일 전) — 이번 달 리밸런싱을 아직 안 하신 것 같아요.')
+        else:
+            st.caption(f'마지막 히스토리 저장: {last_date} ({days}일 전)')
+    else:
+        st.caption('아직 저장된 히스토리가 없습니다. 이번 리밸런싱 후 아래에서 저장해보세요.')
     codes = strategy_codes(); cfgs = get_strategies()
     c1, c2 = st.columns(2)
     run_date = c1.date_input('리밸런싱 기준일', date.today())
@@ -446,8 +508,9 @@ if page == 'Action Plan':
                          'SMA10': None, 'SMA 위': '—', '12M': None, '현재금액': asset_value(a), '목표%': a['target_pct']})
             continue
         close, sma, mom = calc_prices(a)
+        sma_flag = ('YES' if close > sma else 'NO') if sma is not None else '데이터부족'
         rows.append({'idx': i, '전략': a['strategy'], '티커': a['ticker'], 'ETF': a['name'], 'role': a['role'], '종가': close,
-                     'SMA10': sma, 'SMA 위': 'YES' if sma and close > sma else 'NO', '12M': mom,
+                     'SMA10': sma, 'SMA 위': sma_flag, '12M': mom,
                      '현재금액': asset_value(a), '목표%': a['target_pct']})
     vdf = pd.DataFrame(rows)
     st.dataframe(vdf.drop(columns=['idx']) if not vdf.empty else vdf, use_container_width=True, hide_index=True)
@@ -483,7 +546,7 @@ if page == 'Action Plan':
         for _, r in gsm.iterrows():
             is_winner = winner is not None and r['티커'] == winner['티커']
             tgt = total * 0.8 if is_winner else 0.0
-            note = '선정(80%)' if is_winner else ('SMA 이탈' if r['SMA 위'] == 'NO' else '미선정(순위 밀림)')
+            note = '선정(80%)' if is_winner else ('SMA 이탈' if r['SMA 위'] == 'NO' else ('데이터부족' if r['SMA 위'] == '데이터부족' else '미선정(순위 밀림)'))
             plan_rows.append({'전략': 'GSM', '티커': r['티커'], 'ETF': r['ETF'], '현재금액': r['현재금액'], '목표금액': tgt, '매매액(+매수/-매도)': tgt - r['현재금액'], '비고': note})
         cash_tgt = total * (0.2 if winner is not None else 1.0)
         plan_rows.append({'전략': 'GSM', '티커': 'CASH', 'ETF': '현금', '현재금액': cash_cur, '목표금액': cash_tgt, '매매액(+매수/-매도)': cash_tgt - cash_cur, '비고': '전략 대기현금' if winner is not None else '전 후보 SMA 이탈'})
@@ -574,10 +637,33 @@ elif page == '포트폴리오 대시보드':
 
         st.divider(); st.markdown('#### 전체 전략 합산 · 자산분류별 분포')
         cat_df = compute_category_breakdown(assets)
+        targets = get_category_targets()
+        with st.expander('자산군 목표비중 설정', expanded=False):
+            st.caption('전체 포트폴리오 기준 목표비중입니다. 합계가 100%가 아니어도 저장은 되지만, 아래 괴리는 100% 기준으로 계산됩니다.')
+            new_targets = {}
+            tcols = st.columns(3)
+            for i, cat in enumerate(CATEGORY_OPTIONS):
+                with tcols[i % 3]:
+                    new_targets[cat] = st.number_input(cat, min_value=0.0, max_value=100.0, step=1.0, value=n(targets.get(cat, 0)), key=f'cat_tgt_{cat}')
+            tgt_sum = sum(new_targets.values())
+            st.caption(f'목표비중 합계: {tgt_sum:.1f}%' + ('' if abs(tgt_sum - 100) < 0.5 else ' — 100%가 되도록 맞춰보세요.'))
+            if st.button('자산군 목표비중 저장'):
+                put_state('category_targets', new_targets); st.success('저장했습니다.'); st.rerun()
         if not cat_df.empty:
-            show = cat_df.copy(); show['금액'] = show['금액'].map(w); show['비중'] = show['비중'].map(lambda x: f'{x:.1f}%')
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            show = cat_df.copy()
+            show['목표비중'] = show['분류'].map(lambda c: n(targets.get(c, 0)))
+            show['괴리(%p)'] = show['비중'] - show['목표비중']
+            disp_cat = show.copy()
+            disp_cat['금액'] = disp_cat['금액'].map(w)
+            disp_cat['비중'] = disp_cat['비중'].map(lambda x: f'{x:.1f}%')
+            disp_cat['목표비중'] = disp_cat['목표비중'].map(lambda x: f'{x:.1f}%')
+            disp_cat['괴리(%p)'] = disp_cat['괴리(%p)'].map(lambda x: f'{x:+.1f}')
+            st.dataframe(disp_cat, use_container_width=True, hide_index=True)
             st.bar_chart(cat_df.set_index('분류')['비중'])
+            worst = show.reindex(show['괴리(%p)'].abs().sort_values(ascending=False).index).head(3)
+            flagged = worst[worst['괴리(%p)'].abs() >= 3]
+            if not flagged.empty:
+                st.warning('목표비중과 3%p 이상 벌어진 자산군: ' + ', '.join(f"{r['분류']} ({r['괴리(%p)']:+.1f}%p)" for _, r in flagged.iterrows()))
 
 elif page == '전략 구성':
     st.subheader('전략 구성'); st.caption('전략별 계좌 정보와 후보 자산(현금 포함)을 관리합니다.')
@@ -715,7 +801,11 @@ elif page == '전략 구성':
     hist_date = st.date_input('저장할 날짜', date.today(), key='hist_save_date')
     if st.button('오늘 날짜로 전체 스냅샷을 히스토리에 저장', type='primary', key='save_snapshot_btn'):
         total_saved = save_history_snapshot(assets, hist_date)
-        st.success(f'히스토리에 저장했습니다. (총자산 {w(total_saved)})'); st.rerun()
+        st.success(f'히스토리에 저장했습니다. (총자산 {w(total_saved)})')
+        mom = compute_mom_delta()
+        if mom:
+            arrow = '▲' if mom['total_delta'] >= 0 else '▼'
+            st.info(f"직전 저장({mom['prev_date']}) 대비 총자산 {arrow} {w(abs(mom['total_delta']))} ({mom['prev_date']} → {mom['cur_date']})")
 
 elif page == '리밸런싱 히스토리':
     st.subheader('리밸런싱 히스토리')
@@ -726,6 +816,15 @@ elif page == '리밸런싱 히스토리':
         hdf = pd.DataFrame(h).sort_values('date')
         tab1, tab2, tab3, tab4 = st.tabs(['전체', '전략별 총액', '분류별 총액', '세부 내역'])
         with tab1:
+            mom = compute_mom_delta()
+            if mom:
+                st.markdown(f"#### 직전 저장 대비 변화 ({mom['prev_date']} → {mom['cur_date']})")
+                arrow = '▲' if mom['total_delta'] >= 0 else '▼'
+                st.metric('총자산', w(mom['total_cur']), delta=f"{arrow} {w(abs(mom['total_delta']))}")
+                dc1, dc2 = st.columns(2)
+                with dc1: st.caption('전략별 증감'); render_diff_table(mom['by_strategy'])
+                with dc2: st.caption('분류별 증감'); render_diff_table(mom['by_category'])
+                st.divider()
             chart_df = hdf[['date', 'total']].assign(date=lambda x: pd.to_datetime(x.date)).set_index('date')
             st.line_chart(chart_df['total'])
             show = hdf[['date', 'total', 'plan']].copy(); show['total'] = show['total'].map(w)
