@@ -16,7 +16,16 @@ def secret(name, default=''):
     except Exception:
         return default
 
-DB_PATH = secret('SQLITE_PATH', str(ROOT / 'portfolio.db'))
+# app.py를 새로 받을 때마다 저장 위치(폴더)가 달라지면 그 옆의 portfolio.db도 매번 새로 생겨
+# "데이터가 사라진 것처럼" 보인다. 그래서 스크립트 위치와 무관하게 항상 같은 사용자 홈 디렉터리 하위에
+# DB를 둔다. SQLITE_PATH를 secrets에 직접 지정하면 그 값이 우선한다(예: 클라우드 배포 시 영구볼륨 경로).
+try:
+    _default_db_dir = Path.home() / '.asset_allocation_app'
+    _default_db_dir.mkdir(parents=True, exist_ok=True)
+    _default_db_path = str(_default_db_dir / 'portfolio.db')
+except Exception:
+    _default_db_path = str(ROOT / 'portfolio.db')
+DB_PATH = secret('SQLITE_PATH', _default_db_path)
 
 CATEGORY_OPTIONS = ['현금', '금', '선진국 주식', '신흥국 주식', '선진국 채권', '신흥국 채권', '기타']
 YAHOO_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -453,7 +462,46 @@ assets = ensure_cash_rows(clean_records(st.session_state.assets))
 with st.sidebar:
     st.markdown('## 📊 자산배분 도우미')
     page = st.radio('메뉴', ['Action Plan', '포트폴리오 대시보드', '전략 구성', '리밸런싱 히스토리', '성과 비교'])
+    st.divider()
+    device_mode = st.radio('화면 모드', ['자동(반응형)', '💻 PC', '📱 모바일'], index=0, key='device_mode', horizontal=True)
     st.caption('자동주문 없음 · 지정일 실행만 저장')
+
+# '자동' 모드도 CSS 미디어쿼리로 실제 폰 브라우저 폭에서는 반응형으로 줄어든다.
+# '📱 모바일'을 명시적으로 고르면 PC 화면에서도 강제로 모바일 레이아웃(카드형 목록 등)을 미리 볼 수 있다.
+MOBILE = device_mode == '📱 모바일'
+st.markdown("""
+<style>
+.block-container{padding-top:1.2rem;padding-bottom:2rem;}
+@media (max-width: 640px){
+  .block-container{padding:0.6rem 0.7rem 2rem !important;}
+  div[data-testid="stMetricValue"]{font-size:1.3rem !important;}
+  div[data-testid="stMetricLabel"]{font-size:0.8rem !important;}
+  .stButton button{font-size:1rem !important;padding:0.55rem 0.9rem !important;width:100%;}
+  div[data-testid="stDataFrame"]{font-size:0.78rem;}
+  h1{font-size:1.35rem !important;} h3{font-size:1.05rem !important;} h4{font-size:0.95rem !important;}
+}
+</style>
+""", unsafe_allow_html=True)
+if MOBILE:
+    st.markdown("""
+    <style>
+    div[data-testid="stMetricValue"]{font-size:1.3rem !important;}
+    .stButton button{font-size:1rem !important;padding:0.55rem 0.9rem !important;width:100%;}
+    </style>
+    """, unsafe_allow_html=True)
+
+def mobile_card(title, lines, tone=None):
+    """모바일 레이아웃에서 넓은 표 대신 쓰는 세로 카드 한 장."""
+    border = {'pos': '#4FB286', 'neg': '#D6553F'}.get(tone, '#3A3F47')
+    body = '<br>'.join(lines)
+    st.markdown(
+        f'<div style="border-left:4px solid {border};background:rgba(127,127,127,0.06);'
+        f'border-radius:6px;padding:10px 12px;margin-bottom:8px;">'
+        f'<div style="font-weight:600;margin-bottom:4px;">{title}</div>'
+        f'<div style="font-size:0.88rem;line-height:1.5;">{body}</div></div>',
+        unsafe_allow_html=True,
+    )
+
 st.title('자산배분 리밸런싱 도우미'); st.caption('한국/미국 상장 종목 · 10개월 SMA · 12개월 모멘텀 · CAGR/MDD/IRR')
 
 if page == 'Action Plan':
@@ -598,9 +646,18 @@ if page == 'Action Plan':
     if plan_df.empty:
         st.warning('종목 데이터를 먼저 불러오세요.')
     else:
-        show = plan_df.copy()
-        for c in ['현재금액', '목표금액', '매매액(+매수/-매도)']: show[c] = show[c].map(w)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        if MOBILE:
+            for strat, g in plan_df.groupby('전략'):
+                st.markdown(f'##### {strat}')
+                for _, r in g.iterrows():
+                    amt = r['매매액(+매수/-매도)']
+                    tone = 'pos' if amt > 1000 else ('neg' if amt < -1000 else None)
+                    action = f"+{w(amt)} 매수" if amt > 1000 else (f"{w(amt)} 매도" if amt < -1000 else '변동 없음')
+                    mobile_card(r['ETF'], [f"현재 {w(r['현재금액'])} → 목표 {w(r['목표금액'])}", f"<b>{action}</b>", r['비고']], tone=tone)
+        else:
+            show = plan_df.copy()
+            for c in ['현재금액', '목표금액', '매매액(+매수/-매도)']: show[c] = show[c].map(w)
+            st.dataframe(show, use_container_width=True, hide_index=True)
         for strat, g in plan_df.groupby('전략'):
             buys = g[g['매매액(+매수/-매도)'] > 1000]; sells = g[g['매매액(+매수/-매도)'] < -1000]
             parts = []
@@ -625,12 +682,17 @@ elif page == '포트폴리오 대시보드':
             if g.empty: continue
             strat_total = g['현재금액'].sum(); badge = ' · 동적(모멘텀)' if cfg.get('dynamic') else ''
             st.markdown(f"#### {code} · {cfg.get('account', code)}{badge} — {w(strat_total)}")
-            show = g[['ETF', '현재금액', '현재비중', '목표비중']].copy()
-            st.dataframe(show, use_container_width=True, hide_index=True, column_config={
-                '현재금액': st.column_config.NumberColumn('현재금액', format='%d원'),
-                '현재비중': st.column_config.ProgressColumn('현재비중', format='%.1f%%', min_value=0, max_value=100),
-                '목표비중': st.column_config.NumberColumn('목표비중(%)', format='%.1f%%'),
-            })
+            if MOBILE:
+                for _, r in g.iterrows():
+                    st.caption(f"{r['ETF']} — {w(r['현재금액'])} (목표 {r['목표비중']:.1f}%)")
+                    st.progress(min(1.0, max(0.0, r['현재비중'] / 100)), text=f"{r['현재비중']:.1f}%")
+            else:
+                show = g[['ETF', '현재금액', '현재비중', '목표비중']].copy()
+                st.dataframe(show, use_container_width=True, hide_index=True, column_config={
+                    '현재금액': st.column_config.NumberColumn('현재금액', format='%d원'),
+                    '현재비중': st.column_config.ProgressColumn('현재비중', format='%.1f%%', min_value=0, max_value=100),
+                    '목표비중': st.column_config.NumberColumn('목표비중(%)', format='%.1f%%'),
+                })
         st.divider(); st.markdown('#### 전략별 비중 (전체 자산 대비)')
         by_strategy = snap_df.groupby('전략')['현재금액'].sum()
         if grand_total > 0: st.bar_chart((by_strategy / grand_total * 100).rename('비중(%)'))
@@ -862,9 +924,26 @@ elif page == '리밸런싱 히스토리':
                     st.info('이 기록은 구성 스냅샷이 없습니다(이전 버전 저장분).')
                 if rec.get('plan'): st.markdown('**저장 시점 Action Plan 메모**'); st.write(rec['plan'])
     st.divider()
-    st.download_button('JSON 백업', json.dumps({k: get_state(k) for k in ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies']}, ensure_ascii=False, indent=2), file_name='portfolio-backup.json', mime='application/json')
-    if h:
-        st.download_button('CSV 히스토리(요약)', pd.DataFrame(h).drop(columns=['composition', 'by_strategy', 'by_category'], errors='ignore').to_csv(index=False), file_name='rebalance-history.csv', mime='text/csv')
+    st.markdown('### 백업 · 복원')
+    st.caption(f'현재 DB 파일 위치: `{DB_PATH}` — app.py를 다른 폴더로 옮겨도 이 경로는 바뀌지 않습니다.')
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        st.download_button('JSON 백업 다운로드', json.dumps({k: get_state(k) for k in ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies']}, ensure_ascii=False, indent=2), file_name='portfolio-backup.json', mime='application/json')
+        if h:
+            st.download_button('CSV 히스토리(요약)', pd.DataFrame(h).drop(columns=['composition', 'by_strategy', 'by_category'], errors='ignore').to_csv(index=False), file_name='rebalance-history.csv', mime='text/csv')
+    with bc2:
+        up = st.file_uploader('JSON 백업 파일로 복원', type=['json'], key='restore_upload')
+        if up is not None:
+            st.warning('복원하면 현재 저장된 데이터를 덮어씁니다.')
+            if st.button('이 백업으로 복원', type='primary', key='restore_btn'):
+                try:
+                    data = json.loads(up.getvalue().decode('utf-8'))
+                    for k in ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies']:
+                        if k in data: put_state(k, data[k])
+                    st.session_state.pop('assets', None)
+                    st.success('복원했습니다.'); st.rerun()
+                except Exception as e:
+                    st.error(f'복원 실패: {e}')
 
 else:  # 성과 비교
     st.subheader('성과 비교')
