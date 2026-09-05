@@ -879,7 +879,7 @@ elif page == '전략 구성':
             st.warning(f'KRX 종목 목록을 가져오지 못했습니다: {err}\n\nsecrets.toml에 KRX_BASE_URL / KRX_AUTH_KEY가 설정돼 있는지 확인해주세요 (가격 조회에 쓰는 것과 같은 키를 그대로 재사용합니다).')
         filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False) | catalog['name'].str.contains(q, case=False, na=False)] if q else catalog.head(100)
         filtered = filtered.sort_values(['name', 'ticker'])
-        opts = ['선택 안 함'] + [f'{r.name} · {r.ticker} ({r.type})' for _, r in filtered.head(200).iterrows()]
+        opts = ['선택 안 함'] + [f"{r['name']} · {r['ticker']} ({r['type']})" for _, r in filtered.head(200).iterrows()]
         picked = st.selectbox('검색 결과', opts, key='kr_pick')
         if st.button('선택 종목을 전략에 추가', key='kr_add') and picked != '선택 안 함':
             nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
@@ -896,7 +896,7 @@ elif page == '전략 구성':
         results = st.session_state.get('us_results', pd.DataFrame(columns=['ticker', 'name', 'exchange']))
         if not results.empty:
             results = results.sort_values(['name', 'ticker'])
-            opts = ['선택 안 함'] + [f'{r.name} · {r.ticker} ({r.exchange})' for _, r in results.iterrows()]
+            opts = ['선택 안 함'] + [f"{r['name']} · {r['ticker']} ({r['exchange']})" for _, r in results.iterrows()]
             picked = st.selectbox('검색 결과', opts, key='us_pick')
             if st.button('선택 종목을 전략에 추가', key='us_add') and picked != '선택 안 함':
                 nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
