@@ -631,7 +631,20 @@ if page == 'Action Plan':
                      'SMA10': sma, 'SMA 위': sma_flag, '12M': mom,
                      '현재금액': asset_value(a), '목표%': a['target_pct']})
     vdf = pd.DataFrame(rows)
-    st.dataframe(vdf.drop(columns=['idx']) if not vdf.empty else vdf, use_container_width=True, hide_index=True)
+    if not vdf.empty:
+        if MOBILE:
+            for strat, g in vdf.groupby('전략'):
+                st.markdown(f'##### {strat}')
+                for _, r in g.iterrows():
+                    if r['티커'] == 'CASH':
+                        mobile_card(r['ETF'], [f"보유 {w(r['현재금액'])}"])
+                        continue
+                    tone = 'pos' if r['SMA 위'] == 'YES' else ('neg' if r['SMA 위'] == 'NO' else None)
+                    lines = [f"종가 {r['종가']:,.0f} · SMA10 {r['SMA10']:,.0f}" if r['SMA10'] is not None else f"종가 {r['종가']:,.0f} · SMA10 데이터부족",
+                             f"{r['티커']} · SMA {r['SMA 위']} · 12M {p(r['12M']) if r['12M'] is not None else '—'}"]
+                    mobile_card(r['ETF'], lines, tone=tone)
+        else:
+            st.dataframe(vdf.drop(columns=['idx']), use_container_width=True, hide_index=True)
 
     QUARTER_END = run_date.month in (3, 6, 9, 12)
     plan_rows = []
@@ -846,19 +859,33 @@ elif page == '전략 구성':
     disp = disp[['티커', '상품명', '시장', '목표비중', '현재비중', '괴리(%p)', '보유수량', '종가', '현재평가액', '분류']]
 
     st.caption('티커를 직접 수정하면 내부 신호 매핑(ISA/SSO 트리거용)이 끊길 수 있습니다. 종목을 바꾸려면 행을 삭제하고 아래 검색으로 다시 추가하세요. 현금 행은 "보유수량"에 원화 금액을 직접 입력하세요(종가=1).')
-    edited = st.data_editor(
-        disp, num_rows='dynamic', use_container_width=True, hide_index=True,
-        disabled=['현재비중', '괴리(%p)', '종가', '현재평가액'],
-        column_config={
-            '목표비중': st.column_config.NumberColumn('목표비중(%)', min_value=0, max_value=100, step=0.1),
-            '현재비중': st.column_config.ProgressColumn('현재비중', format='%.1f%%', min_value=0, max_value=100),
-            '괴리(%p)': st.column_config.NumberColumn('괴리(%p)', format='%.1f'),
-            '보유수량': st.column_config.NumberColumn('보유수량(현금은 원화금액)', step=0.0001),
-            '종가': st.column_config.NumberColumn('종가(API)', step=0.01),
-            '현재평가액': st.column_config.NumberColumn('현재평가액', format='%d원'),
-            '분류': st.column_config.SelectboxColumn('분류', options=CATEGORY_OPTIONS, required=True),
-        },
-    )
+
+    if MOBILE:
+        for _, r in disp.iterrows():
+            tone = 'pos' if r['괴리(%p)'] > 3 else ('neg' if r['괴리(%p)'] < -3 else None)
+            mobile_card(f"{r['상품명']} ({r['시장']})", [
+                f"{r['티커']} · {r['분류']}",
+                f"현재 {r['현재비중']:.1f}% / 목표 {r['목표비중']:.1f}% (괴리 {r['괴리(%p)']:+.1f}%p)",
+                f"평가액 {w(r['현재평가액'])} · 종가 {r['종가']:,.2f} · 보유수량 {r['보유수량']:,.4f}",
+            ], tone=tone)
+        editor_ctx = st.expander('표로 편집하기 (보유수량·목표비중·분류 수정)', expanded=False)
+    else:
+        editor_ctx = st.container()
+
+    with editor_ctx:
+        edited = st.data_editor(
+            disp, num_rows='dynamic', use_container_width=True, hide_index=True,
+            disabled=['현재비중', '괴리(%p)', '종가', '현재평가액'],
+            column_config={
+                '목표비중': st.column_config.NumberColumn('목표비중(%)', min_value=0, max_value=100, step=0.1),
+                '현재비중': st.column_config.ProgressColumn('현재비중', format='%.1f%%', min_value=0, max_value=100),
+                '괴리(%p)': st.column_config.NumberColumn('괴리(%p)', format='%.1f'),
+                '보유수량': st.column_config.NumberColumn('보유수량(현금은 원화금액)', step=0.0001),
+                '종가': st.column_config.NumberColumn('종가(API)', step=0.01),
+                '현재평가액': st.column_config.NumberColumn('현재평가액', format='%d원'),
+                '분류': st.column_config.SelectboxColumn('분류', options=CATEGORY_OPTIONS, required=True),
+            },
+        )
 
     asset_sum = pd.to_numeric(edited['목표비중'], errors='coerce').fillna(0.0).sum()
     if edit_dynamic:
@@ -974,7 +1001,10 @@ elif page == '리밸런싱 히스토리':
                 show = by_strat.reset_index().rename(columns={'date': '날짜'})
                 for c in show.columns:
                     if c != '날짜': show[c] = show[c].map(lambda x: w(x) if pd.notna(x) else '—')
-                st.dataframe(show, use_container_width=True, hide_index=True)
+                if MOBILE:
+                    with st.expander('전략별 총액 표로 보기'): st.dataframe(show, use_container_width=True, hide_index=True)
+                else:
+                    st.dataframe(show, use_container_width=True, hide_index=True)
         with tab3:
             by_cat = pd.DataFrame([{**{'date': r['date']}, **(r.get('by_category') or {})} for _, r in hdf.iterrows()])
             if not by_cat.empty:
@@ -983,7 +1013,10 @@ elif page == '리밸런싱 히스토리':
                 show = by_cat.reset_index().rename(columns={'date': '날짜'})
                 for c in show.columns:
                     if c != '날짜': show[c] = show[c].map(lambda x: w(x) if pd.notna(x) else '—')
-                st.dataframe(show, use_container_width=True, hide_index=True)
+                if MOBILE:
+                    with st.expander('분류별 총액 표로 보기'): st.dataframe(show, use_container_width=True, hide_index=True)
+                else:
+                    st.dataframe(show, use_container_width=True, hide_index=True)
         with tab4:
             options = [r['date'] for r in h]
             pick = st.selectbox('세부 내역을 볼 날짜', options)
@@ -992,9 +1025,15 @@ elif page == '리밸런싱 히스토리':
                 comp = rec.get('composition') or []
                 if comp:
                     cdf = pd.DataFrame(comp)
-                    show = cdf.copy(); show['현재금액'] = show['현재금액'].map(w)
-                    show['현재비중'] = show['현재비중'].map(lambda x: f'{x:.1f}%'); show['목표비중'] = show['목표비중'].map(lambda x: f'{x:.1f}%')
-                    st.dataframe(show, use_container_width=True, hide_index=True)
+                    if MOBILE:
+                        for strat, g in cdf.groupby('전략'):
+                            st.markdown(f'##### {strat}')
+                            for _, r in g.iterrows():
+                                mobile_card(r['ETF'], [f"{r['티커']} · {r['분류']}", f"{w(r['현재금액'])} ({r['현재비중']:.1f}% / 목표 {r['목표비중']:.1f}%)"])
+                    else:
+                        show = cdf.copy(); show['현재금액'] = show['현재금액'].map(w)
+                        show['현재비중'] = show['현재비중'].map(lambda x: f'{x:.1f}%'); show['목표비중'] = show['목표비중'].map(lambda x: f'{x:.1f}%')
+                        st.dataframe(show, use_container_width=True, hide_index=True)
                 else:
                     st.info('이 기록은 구성 스냅샷이 없습니다(이전 버전 저장분).')
                 if rec.get('plan'): st.markdown('**저장 시점 Action Plan 메모**'); st.write(rec['plan'])
