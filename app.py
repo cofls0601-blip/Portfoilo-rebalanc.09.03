@@ -162,20 +162,69 @@ def cache_clear_prices():
     init_db(); con = sqlite3.connect(DB_PATH); con.execute('DELETE FROM price_cache'); con.commit(); con.close()
 
 # ---------- KRX 종목(ETF+개별주식) 카탈로그 ----------
+DATA_GO_STOCK_INFO_URL = 'https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo'
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_kr_individual_stocks(asof):
+    """코스피/코스닥 개별종목(삼성전자 등) 이름+코드 목록.
+    KRX Open API의 etf_bydd_trd는 이름 그대로 ETF 전용이라 개별종목이 원천적으로 안 나오고,
+    pykrx(비공식 스크래핑)는 KRX 사이트 변경으로 로그인 요구/파싱 실패가 잦아 신뢰할 수 없다.
+    공공데이터포털의 금융위원회_주식시세정보(GetStockSecuritiesInfoService)는 정부가 운영하는
+    공식 REST API라 훨씬 안정적이다. https://www.data.go.kr/data/15094808/openapi.do
+    """
+    key = secret('DATA_GO_SERVICE_KEY')
+    empty = pd.DataFrame(columns=['ticker', 'name', 'market', 'type'])
+    if not key:
+        empty.attrs['error'] = 'DATA_GO_SERVICE_KEY가 secrets에 설정되어 있지 않음(개별종목 검색에 필요, data.go.kr에서 "금융위원회_주식시세정보" 활용신청 후 발급받은 키)'
+        return empty
+    d = pd.Timestamp(asof)
+    last_err = ''
+    for _ in range(10):
+        try:
+            rows_all = []; page = 1
+            while page <= 6:
+                r = requests.get(DATA_GO_STOCK_INFO_URL, params={
+                    'serviceKey': key, 'resultType': 'json', 'numOfRows': 1000, 'pageNo': page,
+                    'basDt': d.strftime('%Y%m%d'),
+                }, timeout=30)
+                r.raise_for_status()
+                body = (r.json().get('response') or {}).get('body') or {}
+                items = (body.get('items') or {}).get('item') or []
+                if isinstance(items, dict): items = [items]
+                if not items: break
+                rows_all.extend(items)
+                total = int(body.get('totalCount', 0) or 0)
+                if len(rows_all) >= total: break
+                page += 1
+            if rows_all:
+                out = pd.DataFrame([
+                    {'ticker': re.sub(r'\D', '', str(x.get('srtnCd', ''))), 'name': str(x.get('itmsNm', '')), 'mkt': str(x.get('mrktCtg', ''))}
+                    for x in rows_all if x.get('srtnCd')
+                ])
+                out = out[out['ticker'] != '']
+                if not out.empty:
+                    out['type'] = out['mkt'].map(lambda m: f'주식({m})' if m else '주식')
+                    out['market'] = 'KR'
+                    return out[['ticker', 'name', 'market', 'type']].drop_duplicates('ticker')
+        except Exception as e:
+            last_err = str(e)
+        d -= pd.Timedelta(days=1)
+    empty.attrs['error'] = last_err or '공공데이터포털 응답이 비어 있음(휴장일 반복?)'
+    return empty
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_krx_universe(asof, source='krx'):
     """한국 상장 종목(ETF+개별주식) 검색용 카탈로그.
     이전에는 pykrx(비공식 스크래핑 라이브러리)에만 의존했는데, 설치가 안 돼 있거나 실패하면
     아무 안내 없이 빈 목록이 나오는 문제가 있었다. 이제는 가격 조회에 이미 쓰고 있는(즉 이미
-    인증이 확인된) KRX Open API 응답에서 직접 ETF 전체 목록(티커+이름)을 뽑아 우선 사용하고,
-    pykrx는 개별주식 보강용으로만 best-effort로 시도한다.
+    인증이 확인된) KRX Open API 응답에서 ETF 목록을, 공공데이터포털 API에서 개별종목 목록을
+    각각 안정적으로 직접 구성한다. pykrx는 혹시 몰라 최후의 보강 수단으로만 시도한다.
     반환값에 'error' 컬럼이 있으면 검색 UI에서 그 사유를 그대로 보여준다.
     """
-    frames = []; note = ''
+    frames = []; notes = []
     url, key = secret('KRX_BASE_URL'), secret('KRX_AUTH_KEY')
     if url and key:
-        d = pd.Timestamp(asof)
-        got = False
+        d = pd.Timestamp(asof); got = False; etf_err = ''
         for _ in range(10):
             try:
                 r = requests.get(url, headers={'AUTH_KEY': key}, params={'basDd': d.strftime('%Y%m%d')}, timeout=30)
@@ -191,18 +240,25 @@ def load_krx_universe(asof, source='krx'):
                     frames.append(etf_df); got = True
                     break
             except Exception as e:
-                note = str(e)
+                etf_err = str(e)
             d -= pd.Timedelta(days=1)
-        if not got and not note: note = 'KRX 응답이 비어 있음(휴장일 반복?)'
+        if not got: notes.append(f'ETF: {etf_err or "응답이 비어 있음(휴장일 반복?)"}')
     else:
-        note = 'KRX_AUTH_KEY/KRX_BASE_URL이 secrets에 설정되어 있지 않음'
+        notes.append('ETF: KRX_AUTH_KEY/KRX_BASE_URL이 secrets에 설정되어 있지 않음')
+
+    stocks = load_kr_individual_stocks(asof)
+    if not stocks.empty:
+        frames.append(stocks)
+    else:
+        notes.append(f"개별종목: {stocks.attrs.get('error', '가져오지 못함')}")
+
     try:
         from pykrx import stock
         for mkt in ('KOSPI', 'KOSDAQ'):
             st_t = stock.get_market_ticker_list(pd.Timestamp(asof).strftime('%Y%m%d'), market=mkt)
             frames.append(pd.DataFrame([{'ticker': str(t), 'name': str(stock.get_market_ticker_name(t)), 'type': f'주식({mkt})'} for t in st_t]))
     except Exception:
-        pass  # 개별주식 보강은 실패해도 ETF 검색엔 지장 없음(조용히 건너뜀)
+        pass  # 개별주식 보강은 실패해도 지장 없음(조용히 건너뜀) — 이미 data.go.kr로 커버됨
     if frames:
         out = pd.concat(frames, ignore_index=True).drop_duplicates(subset=['ticker'])
         out['market'] = 'KR'
@@ -212,7 +268,7 @@ def load_krx_universe(asof, source='krx'):
         d2 = pd.read_csv(p, dtype=str).fillna(''); d2['type'] = 'ETF'
         return d2
     empty = pd.DataFrame(columns=['ticker', 'name', 'market', 'type'])
-    empty.attrs['error'] = note or 'KRX 목록을 가져오지 못함'
+    empty.attrs['error'] = ' / '.join(notes) if notes else '목록을 가져오지 못함'
     return empty
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -239,16 +295,18 @@ def normalize_payload(payload, requested=''):
     for x in rows or []:
         if not isinstance(x, dict): continue
         # KRX Open API(ETF 일별매매정보)는 종목코드 필드가 ISU_CD, 기준일자가 BAS_DD로 온다.
-        # 이 두 키가 빠져 있으면 모든 행의 ticker가 요청값(requested)으로 뭉개지고, 그 결과
+        # 공공데이터포털 금융위원회_주식시세정보는 종목코드가 srtnCd, 기준일자가 basDt, 종가가 clpr, 종목명이 itmsNm이다.
+        # 이 키들이 빠져 있으면 모든 행의 ticker가 요청값(requested)으로 뭉개지고, 그 결과
         # 필터링이 항상 "전체 응답"을 반환해 마지막 행(임의의 한 종목) 가격이 모든 티커에 붙는 버그가 생긴다.
-        raw_ticker = str(x.get('symbol', x.get('ISU_SRT_CD', x.get('ISU_CD', x.get('isu_srt_cd', x.get('ticker', requested))))))
+        raw_ticker = str(x.get('symbol', x.get('ISU_SRT_CD', x.get('ISU_CD', x.get('srtnCd', x.get('isu_srt_cd', x.get('ticker', requested)))))))
         digits = re.sub(r'\D', '', raw_ticker)
         ticker = digits if digits else raw_ticker.replace('.KS', '').strip()
-        d = str(x.get('date', x.get('basDd', x.get('BAS_DD', x.get('stck_bsop_date', ''))))).replace('-', '')
-        close = x.get('close', x.get('TDD_CLSPRC', x.get('stck_clpr', x.get('price'))))
+        d = str(x.get('date', x.get('basDd', x.get('BAS_DD', x.get('basDt', x.get('stck_bsop_date', '')))))).replace('-', '')
+        close = x.get('close', x.get('TDD_CLSPRC', x.get('clpr', x.get('stck_clpr', x.get('price')))))
+        name = x.get('name', x.get('ISU_NM', x.get('itmsNm', '')))
         if close is None or close == '-': continue
         try:
-            out.append({'ticker': ticker, 'date': d, 'close': float(str(close).replace(',', ''))})
+            out.append({'ticker': ticker, 'date': d, 'close': float(str(close).replace(',', '')), 'name': str(name)})
         except (ValueError, TypeError):
             pass
     return pd.DataFrame(out)
@@ -262,8 +320,10 @@ def fetch_day(source, ticker, day):
     else:
         url, key = secret('DATA_GO_URL'), secret('DATA_GO_SERVICE_KEY')
         if not url or not key: raise RuntimeError('DATA_GO_URL/DATA_GO_SERVICE_KEY 미설정')
-        r = requests.get(url, params={'serviceKey': key, 'resultType': 'json', 'numOfRows': 1000, 'pageNo': 1,
-                                       'basDt': day.replace('-', ''), 'itmsNm': ticker}, timeout=30)
+        # 금융위원회_주식시세정보 API는 종목코드 검색이 itmsNm(종목명)이 아니라 likeSrtnCd(종목코드 LIKE검색)다.
+        # itmsNm에 숫자 코드를 넣으면 절대 매칭이 안 된다.
+        r = requests.get(url, params={'serviceKey': key, 'resultType': 'json', 'numOfRows': 10, 'pageNo': 1,
+                                       'basDt': day.replace('-', ''), 'likeSrtnCd': ticker_norm}, timeout=30)
     r.raise_for_status(); df = normalize_payload(r.json(), ticker_norm)
     if df.empty: raise RuntimeError(f'{ticker}: 응답 없음(휴장일이거나 API 설정 확인 필요)')
     hit = df[df['ticker'].eq(ticker_norm)]
@@ -903,7 +963,7 @@ elif page == '전략 구성':
         catalog = load_krx_universe(date.today().isoformat())
         if catalog.empty:
             err = catalog.attrs.get('error', '알 수 없는 이유로 목록을 가져오지 못했습니다.')
-            st.warning(f'KRX 종목 목록을 가져오지 못했습니다: {err}\n\nsecrets.toml에 KRX_BASE_URL / KRX_AUTH_KEY가 설정돼 있는지 확인해주세요 (가격 조회에 쓰는 것과 같은 키를 그대로 재사용합니다).')
+            st.warning(f'종목 목록을 가져오지 못했습니다.\n\n{err}\n\nETF는 secrets.toml의 KRX_BASE_URL/KRX_AUTH_KEY(가격 조회와 동일)를, 개별종목은 DATA_GO_SERVICE_KEY(data.go.kr "금융위원회_주식시세정보" 활용신청)를 확인해주세요.')
         filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False) | catalog['name'].str.contains(q, case=False, na=False)] if q else catalog.head(100)
         filtered = filtered.sort_values(['name', 'ticker'])
         opts = ['선택 안 함'] + [f"{r['name']} · {r['ticker']} ({r['type']})" for _, r in filtered.head(200).iterrows()]
