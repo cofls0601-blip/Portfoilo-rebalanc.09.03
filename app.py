@@ -125,6 +125,7 @@ def default_assets():
 # ---------- SQLite persistence ----------
 def init_db():
     con = sqlite3.connect(DB_PATH); con.execute('CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT NOT NULL)')
+    con.execute('CREATE TABLE IF NOT EXISTS price_cache(ticker TEXT, date TEXT, close REAL, PRIMARY KEY(ticker, date))')
     for k, v in [
         ('assets', default_assets().to_json(orient='records', force_ascii=False)),
         ('history', '[]'), ('equity', '[]'), ('cashflows', '[]'), ('benchmarks', '[]'),
@@ -143,32 +144,76 @@ def put_state(k, v):
     con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)', (k, json.dumps(v, ensure_ascii=False, default=str)))
     con.commit(); con.close()
 
+# ---------- 종목별 가격 캐시 (과거 확정 데이터는 다시 불러올 필요 없음) ----------
+def cache_get_prices(ticker):
+    init_db(); con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query('SELECT date, close FROM price_cache WHERE ticker=? ORDER BY date', con, params=(ticker,))
+    con.close()
+    return df
+
+def cache_put_prices(ticker, rows):
+    if not rows: return
+    init_db(); con = sqlite3.connect(DB_PATH)
+    con.executemany('INSERT OR REPLACE INTO price_cache(ticker,date,close) VALUES(?,?,?)',
+                     [(ticker, r['date'], r['close']) for r in rows if r.get('date') and r.get('close') is not None])
+    con.commit(); con.close()
+
+def cache_clear_prices():
+    init_db(); con = sqlite3.connect(DB_PATH); con.execute('DELETE FROM price_cache'); con.commit(); con.close()
+
 # ---------- KRX 종목(ETF+개별주식) 카탈로그 ----------
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_krx_universe(asof):
-    frames = []
-    try:
-        from pykrx import stock
-        etf_t = stock.get_etf_ticker_list(asof.replace('-', ''))
-        frames.append(pd.DataFrame([{'ticker': str(t), 'name': str(stock.get_etf_ticker_name(t)), 'type': 'ETF'} for t in etf_t]))
-    except Exception:
-        pass
+def load_krx_universe(asof, source='krx'):
+    """한국 상장 종목(ETF+개별주식) 검색용 카탈로그.
+    이전에는 pykrx(비공식 스크래핑 라이브러리)에만 의존했는데, 설치가 안 돼 있거나 실패하면
+    아무 안내 없이 빈 목록이 나오는 문제가 있었다. 이제는 가격 조회에 이미 쓰고 있는(즉 이미
+    인증이 확인된) KRX Open API 응답에서 직접 ETF 전체 목록(티커+이름)을 뽑아 우선 사용하고,
+    pykrx는 개별주식 보강용으로만 best-effort로 시도한다.
+    반환값에 'error' 컬럼이 있으면 검색 UI에서 그 사유를 그대로 보여준다.
+    """
+    frames = []; note = ''
+    url, key = secret('KRX_BASE_URL'), secret('KRX_AUTH_KEY')
+    if url and key:
+        d = pd.Timestamp(asof)
+        got = False
+        for _ in range(10):
+            try:
+                r = requests.get(url, headers={'AUTH_KEY': key}, params={'basDd': d.strftime('%Y%m%d')}, timeout=30)
+                r.raise_for_status()
+                rows = r.json().get('OutBlock_1', [])
+                if rows:
+                    etf_df = pd.DataFrame([
+                        {'ticker': re.sub(r'\D', '', str(x.get('ISU_CD', ''))), 'name': str(x.get('ISU_NM', ''))}
+                        for x in rows if x.get('ISU_CD')
+                    ])
+                    etf_df = etf_df[etf_df['ticker'] != '']
+                    etf_df['type'] = 'ETF'
+                    frames.append(etf_df); got = True
+                    break
+            except Exception as e:
+                note = str(e)
+            d -= pd.Timedelta(days=1)
+        if not got and not note: note = 'KRX 응답이 비어 있음(휴장일 반복?)'
+    else:
+        note = 'KRX_AUTH_KEY/KRX_BASE_URL이 secrets에 설정되어 있지 않음'
     try:
         from pykrx import stock
         for mkt in ('KOSPI', 'KOSDAQ'):
-            st_t = stock.get_market_ticker_list(asof.replace('-', ''), market=mkt)
+            st_t = stock.get_market_ticker_list(pd.Timestamp(asof).strftime('%Y%m%d'), market=mkt)
             frames.append(pd.DataFrame([{'ticker': str(t), 'name': str(stock.get_market_ticker_name(t)), 'type': f'주식({mkt})'} for t in st_t]))
     except Exception:
-        pass
+        pass  # 개별주식 보강은 실패해도 ETF 검색엔 지장 없음(조용히 건너뜀)
     if frames:
         out = pd.concat(frames, ignore_index=True).drop_duplicates(subset=['ticker'])
         out['market'] = 'KR'
         if not out.empty: return out
     p = ROOT / 'krx_etf_fallback.csv'
     if p.exists():
-        d = pd.read_csv(p, dtype=str).fillna(''); d['type'] = 'ETF'
-        return d
-    return pd.DataFrame(columns=['ticker', 'name', 'market', 'type'])
+        d2 = pd.read_csv(p, dtype=str).fillna(''); d2['type'] = 'ETF'
+        return d2
+    empty = pd.DataFrame(columns=['ticker', 'name', 'market', 'type'])
+    empty.attrs['error'] = note or 'KRX 목록을 가져오지 못함'
+    return empty
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_us_symbols(query):
@@ -236,26 +281,51 @@ def find_trading_day_price(source, ticker, target_date, max_back=10):
             d -= pd.Timedelta(days=1)
     return None
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_monthly(source, ticker, day):
-    # 월말 날짜가 정확히 휴장일이면(전체 달의 ~30%가 주말) 종전 로직은 그 달을 통째로 건너뛰어
-    # prices가 10개월 미만으로 남는 경우가 잦았고, 그 결과 SMA가 0으로 계산되는 버그가 있었다.
-    dates = pd.date_range(end=pd.Timestamp(day), periods=13, freq='ME'); rows = []
+    # 월말 날짜가 정확히 휴장일이면(전체 달의 ~30%가 주말) 그 달을 통째로 건너뛰어 prices가
+    # 10개월 미만으로 남고 SMA가 0이 되는 버그가 있었다 — find_trading_day_price로 이미 해결.
+    # 여기서는 "이미 지나간 달"의 데이터는 DB 캐시에서 재사용하고, 아직 진행 중인 이번 달만 새로 조회한다.
+    ticker_norm = re.sub(r'\D', '', str(ticker)) or str(ticker)
+    dates = pd.date_range(end=pd.Timestamp(day), periods=13, freq='ME')
+    cur_month = pd.Timestamp(day).strftime('%Y%m')
+    cached = cache_get_prices(ticker_norm)
+    cached_by_month = {}
+    if not cached.empty:
+        tmp = cached.copy(); tmp['month'] = tmp['date'].str[:6]
+        cached_by_month = {m: g.sort_values('date').iloc[-1].to_dict() for m, g in tmp.groupby('month')}
+    rows = []; new_rows = []
     for d in dates:
-        row = find_trading_day_price(source, ticker, d)
-        if row: rows.append(row)
+        m = d.strftime('%Y%m')
+        if m != cur_month and m in cached_by_month:
+            rows.append(cached_by_month[m])
+        else:
+            row = find_trading_day_price(source, ticker, d)
+            if row:
+                rows.append(row); new_rows.append(row)
+    if new_rows: cache_put_prices(ticker_norm, new_rows)
     return pd.DataFrame(rows)
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_daily_recent(source, ticker, day, days=120):
-    end = pd.Timestamp(day); dates = [end - pd.Timedelta(days=i) for i in range(days, -1, -1)]
-    dates = [d for d in dates if d.weekday() < 5]; rows = []
-    for d in dates:
+    # 이미 캐시된 날짜는 건너뛰고, 캐시에 없는(주로 지난번 조회 이후 새로 생긴) 거래일만 조회한다.
+    # 첫 조회는 예전과 동일하게 느리지만, 두 번째 조회부터는 신규 거래일 수십 개 정도만 불러오면 된다.
+    ticker_norm = re.sub(r'\D', '', str(ticker)) or str(ticker)
+    end = pd.Timestamp(day); all_dates = [end - pd.Timedelta(days=i) for i in range(days, -1, -1)]
+    all_dates = [d for d in all_dates if d.weekday() < 5]
+    cached = cache_get_prices(ticker_norm)
+    have_dates = set(cached['date']) if not cached.empty else set()
+    new_rows = []
+    for d in all_dates:
+        if d.strftime('%Y%m%d') in have_dates: continue
         try:
-            x = fetch_day(source, str(ticker), d.strftime('%Y-%m-%d')); rows.append(x.iloc[-1].to_dict())
+            x = fetch_day(source, str(ticker), d.strftime('%Y-%m-%d')); new_rows.append(x.iloc[-1].to_dict())
         except Exception:
             pass
-    return pd.DataFrame(rows)
+    if new_rows: cache_put_prices(ticker_norm, new_rows)
+    start_str = (end - pd.Timedelta(days=days)).strftime('%Y%m%d'); end_str = end.strftime('%Y%m%d')
+    combined = pd.concat([cached, pd.DataFrame(new_rows)], ignore_index=True) if new_rows else cached
+    if combined.empty: return combined
+    combined = combined.drop_duplicates('date').sort_values('date')
+    return combined[(combined['date'] >= start_str) & (combined['date'] <= end_str)]
 
 # ---------- Yahoo Finance 가격 어댑터 (미국 상장 종목 + 벤치마크) ----------
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -804,27 +874,32 @@ elif page == '전략 구성':
     if mkt_choice == '한국(KRX)':
         q = st.text_input('티커 또는 종목명 일부 입력', key='kr_q')
         catalog = load_krx_universe(date.today().isoformat())
+        if catalog.empty:
+            err = catalog.attrs.get('error', '알 수 없는 이유로 목록을 가져오지 못했습니다.')
+            st.warning(f'KRX 종목 목록을 가져오지 못했습니다: {err}\n\nsecrets.toml에 KRX_BASE_URL / KRX_AUTH_KEY가 설정돼 있는지 확인해주세요 (가격 조회에 쓰는 것과 같은 키를 그대로 재사용합니다).')
         filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False) | catalog['name'].str.contains(q, case=False, na=False)] if q else catalog.head(100)
-        opts = ['선택 안 함'] + [f'{r.ticker} · {r.name} ({r.type})' for _, r in filtered.head(200).iterrows()]
+        filtered = filtered.sort_values(['name', 'ticker'])
+        opts = ['선택 안 함'] + [f'{r.name} · {r.ticker} ({r.type})' for _, r in filtered.head(200).iterrows()]
         picked = st.selectbox('검색 결과', opts, key='kr_pick')
         if st.button('선택 종목을 전략에 추가', key='kr_add') and picked != '선택 안 함':
-            t = picked.split(' · ')[0]; nm = picked.split(' · ', 1)[1].rsplit(' (', 1)[0]
+            nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
             assets.loc[len(assets)] = {'id': str(len(assets) + 1), 'strategy': chosen, 'ticker': t, 'name': nm, 'market': 'KR',
                                         'role': '사용자 추가', 'target_pct': 0.0, 'shares': 0.0, 'close': 0.0, 'prices': [],
                                         'signal_ticker': t, 'category': '기타'}
             st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
             st.success(f'{t} {nm} 추가'); st.rerun()
-        st.caption(f'KRX 목록 {len(catalog):,}개 (ETF+개별주식) · pykrx 런타임 조회, 실패 시 CSV 폴백')
+        st.caption(f'KRX 목록 {len(catalog):,}개 (ETF는 이미 설정된 KRX_AUTH_KEY로 조회, 개별주식은 pykrx 보강 시도)')
     else:
         q = st.text_input('종목명 또는 티커 입력 (예: Apple, AAPL)', key='us_q')
         if st.button('검색', key='us_search') and q:
             st.session_state.us_results = search_us_symbols(q)
         results = st.session_state.get('us_results', pd.DataFrame(columns=['ticker', 'name', 'exchange']))
         if not results.empty:
-            opts = ['선택 안 함'] + [f'{r.ticker} · {r.name} ({r.exchange})' for _, r in results.iterrows()]
+            results = results.sort_values(['name', 'ticker'])
+            opts = ['선택 안 함'] + [f'{r.name} · {r.ticker} ({r.exchange})' for _, r in results.iterrows()]
             picked = st.selectbox('검색 결과', opts, key='us_pick')
             if st.button('선택 종목을 전략에 추가', key='us_add') and picked != '선택 안 함':
-                t = picked.split(' · ')[0]; nm = picked.split(' · ', 1)[1].rsplit(' (', 1)[0]
+                nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
                 assets.loc[len(assets)] = {'id': str(len(assets) + 1), 'strategy': chosen, 'ticker': t, 'name': nm, 'market': 'US',
                                             'role': '사용자 추가', 'target_pct': 0.0, 'shares': 0.0, 'close': 0.0, 'prices': [],
                                             'signal_ticker': t, 'category': '기타'}
@@ -944,6 +1019,16 @@ elif page == '리밸런싱 히스토리':
                     st.success('복원했습니다.'); st.rerun()
                 except Exception as e:
                     st.error(f'복원 실패: {e}')
+
+    st.divider()
+    st.markdown('### 가격 캐시')
+    init_db(); _con = sqlite3.connect(DB_PATH)
+    _n_cached = _con.execute('SELECT COUNT(*) FROM price_cache').fetchone()[0]
+    _n_tickers = _con.execute('SELECT COUNT(DISTINCT ticker) FROM price_cache').fetchone()[0]
+    _con.close()
+    st.caption(f'캐시된 가격 데이터: 종목 {_n_tickers}개 · {_n_cached:,}개 날짜. 지나간 달/과거 거래일은 캐시에서 재사용하고, 새로 생긴 날짜만 조회합니다.')
+    if st.button('가격 캐시 전체 삭제(다음 조회부터 처음부터 다시 받음)'):
+        cache_clear_prices(); st.success('캐시를 삭제했습니다.')
 
 else:  # 성과 비교
     st.subheader('성과 비교')
