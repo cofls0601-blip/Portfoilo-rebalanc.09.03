@@ -601,7 +601,20 @@ with st.sidebar:
 MOBILE = device_mode == '📱 모바일'
 st.markdown("""
 <style>
+:root{
+  --sage:#8DA377; --sage-dark:#6E8A5B; --sage-tint:rgba(141,163,119,0.14);
+  --terracotta:#C1795A; --terracotta-dark:#A15E42; --terracotta-tint:rgba(193,121,90,0.14);
+  --olive:#7D7A4F; --olive-dark:#5F5D3C;
+  --beige:#F4EFE6; --beige-deep:#EAE1D0; --ink:#4A4638;
+}
+.stApp{background-color:var(--beige);}
 .block-container{padding-top:1.2rem;padding-bottom:2rem;}
+h1, h2, h3, h4{color:var(--olive-dark) !important;}
+div[data-testid="stMetricValue"]{color:var(--olive-dark) !important;}
+.stButton button[kind="primary"]{background-color:var(--sage-dark) !important;border-color:var(--sage-dark) !important;}
+.stButton button[kind="secondary"], .stButton button:not([kind]){border-color:var(--beige-deep) !important;color:var(--ink) !important;}
+div[data-testid="stExpander"]{background-color:rgba(255,255,255,0.4); border-color:var(--beige-deep) !important;}
+.stTabs [aria-selected="true"]{color:var(--sage-dark) !important; border-bottom-color:var(--sage-dark) !important;}
 @media (max-width: 640px){
   .block-container{padding:0.6rem 0.7rem 2rem !important;}
   div[data-testid="stMetricValue"]{font-size:1.3rem !important;}
@@ -621,14 +634,15 @@ if MOBILE:
     """, unsafe_allow_html=True)
 
 def mobile_card(title, lines, tone=None):
-    """모바일 레이아웃에서 넓은 표 대신 쓰는 세로 카드 한 장."""
-    border = {'pos': '#4FB286', 'neg': '#D6553F'}.get(tone, '#3A3F47')
+    """넓은 표 대신 쓰는 세로 카드 한 장. tone에 따라 세이지그린(양호)/테라코타(주의) 테두리."""
+    border = {'pos': 'var(--sage-dark)', 'neg': 'var(--terracotta-dark)'}.get(tone, 'var(--beige-deep)')
+    tint = {'pos': 'var(--sage-tint)', 'neg': 'var(--terracotta-tint)'}.get(tone, 'rgba(122,110,80,0.05)')
     body = '<br>'.join(lines)
     st.markdown(
-        f'<div style="border-left:4px solid {border};background:rgba(127,127,127,0.06);'
+        f'<div style="border-left:4px solid {border};background:{tint};'
         f'border-radius:6px;padding:10px 12px;margin-bottom:8px;">'
-        f'<div style="font-weight:600;margin-bottom:4px;">{title}</div>'
-        f'<div style="font-size:0.88rem;line-height:1.5;">{body}</div></div>',
+        f'<div style="font-weight:700;margin-bottom:4px;color:var(--olive-dark);">{title}</div>'
+        f'<div style="font-size:0.88rem;line-height:1.6;color:var(--ink);">{body}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -691,20 +705,6 @@ if page == 'Action Plan':
                      'SMA10': sma, 'SMA 위': sma_flag, '12M': mom,
                      '현재금액': asset_value(a), '목표%': a['target_pct']})
     vdf = pd.DataFrame(rows)
-    if not vdf.empty:
-        if MOBILE:
-            for strat, g in vdf.groupby('전략'):
-                st.markdown(f'##### {strat}')
-                for _, r in g.iterrows():
-                    if r['티커'] == 'CASH':
-                        mobile_card(r['ETF'], [f"보유 {w(r['현재금액'])}"])
-                        continue
-                    tone = 'pos' if r['SMA 위'] == 'YES' else ('neg' if r['SMA 위'] == 'NO' else None)
-                    lines = [f"종가 {r['종가']:,.0f} · SMA10 {r['SMA10']:,.0f}" if r['SMA10'] is not None else f"종가 {r['종가']:,.0f} · SMA10 데이터부족",
-                             f"{r['티커']} · SMA {r['SMA 위']} · 12M {p(r['12M']) if r['12M'] is not None else '—'}"]
-                    mobile_card(r['ETF'], lines, tone=tone)
-        else:
-            st.dataframe(vdf.drop(columns=['idx']), use_container_width=True, hide_index=True)
 
     QUARTER_END = run_date.month in (3, 6, 9, 12)
     plan_rows = []
@@ -785,23 +785,54 @@ if page == 'Action Plan':
             plan_rows.append({'전략': code, '티커': 'CASH', 'ETF': '현금', '현재금액': cash, '목표금액': cash_tgt, '매매액(+매수/-매도)': cash_tgt - cash, '비고': '현금 목표비중'})
 
     plan_df = pd.DataFrame(plan_rows)
-    st.subheader('이번 달 Action Plan (매수/매도 금액)')
-    if plan_df.empty:
+    st.subheader('이번 달 상태 & 액션플랜')
+    st.caption('종목별 SMA·모멘텀 상태와 그에 따른 매수/매도 액션을 한 번에 봅니다.')
+    if plan_df.empty or vdf.empty:
         st.warning('종목 데이터를 먼저 불러오세요.')
     else:
+        sig_lookup = {(r['전략'], r['티커']): r for _, r in vdf.iterrows()}
+        merged_rows = []
+        for _, pr in plan_df.iterrows():
+            sig = sig_lookup.get((pr['전략'], pr['티커']), {})
+            merged_rows.append({
+                '전략': pr['전략'], '티커': pr['티커'], 'ETF': pr['ETF'],
+                '종가': sig.get('종가'), 'SMA10': sig.get('SMA10'), 'SMA 위': sig.get('SMA 위'), '12M': sig.get('12M'),
+                '현재금액': pr['현재금액'], '목표금액': pr['목표금액'],
+                '매매액(+매수/-매도)': pr['매매액(+매수/-매도)'], '비고': pr['비고'],
+            })
+        merged_df = pd.DataFrame(merged_rows)
         if MOBILE:
-            for strat, g in plan_df.groupby('전략'):
+            for strat, g in merged_df.groupby('전략'):
                 st.markdown(f'##### {strat}')
                 for _, r in g.iterrows():
                     amt = r['매매액(+매수/-매도)']
                     tone = 'pos' if amt > 1000 else ('neg' if amt < -1000 else None)
                     action = f"+{w(amt)} 매수" if amt > 1000 else (f"{w(amt)} 매도" if amt < -1000 else '변동 없음')
-                    mobile_card(r['ETF'], [f"현재 {w(r['현재금액'])} → 목표 {w(r['목표금액'])}", f"<b>{action}</b>", r['비고']], tone=tone)
+                    if r['티커'] == 'CASH':
+                        lines = [f"{w(r['현재금액'])} → {w(r['목표금액'])}", f"<b>{action}</b>", r['비고']]
+                    else:
+                        sma_txt = f"<b>SMA10</b> {r['SMA10']:,.0f} ({r['SMA 위']})" if r['SMA10'] is not None else '<b>SMA10</b> 데이터부족'
+                        mom_txt = f"<b>12M</b> {p(r['12M'])}" if r['12M'] is not None else '<b>12M</b> —'
+                        lines = [
+                            f"<b>종가</b> {r['종가']:,.0f} · {sma_txt}",
+                            mom_txt,
+                            f"{w(r['현재금액'])} → {w(r['목표금액'])}",
+                            f"<b>{action}</b>",
+                            r['비고'],
+                        ]
+                    mobile_card(r['ETF'], lines, tone=tone)
         else:
-            show = plan_df.copy()
+            show = merged_df.copy()
+            show['SMA10'] = show['SMA10'].map(lambda x: f'{x:,.0f}' if x is not None else '데이터부족')
+            show['12M'] = show['12M'].map(lambda x: p(x) if x is not None else '—')
+            show['SMA 위'] = show['SMA 위'].fillna('—')
             for c in ['현재금액', '목표금액', '매매액(+매수/-매도)']: show[c] = show[c].map(w)
-            st.dataframe(show, use_container_width=True, hide_index=True)
-        for strat, g in plan_df.groupby('전략'):
+            st.dataframe(show, use_container_width=True, hide_index=True, column_config={
+                'SMA10': st.column_config.TextColumn('SMA10 (월봉 10개월)'),
+                'SMA 위': st.column_config.TextColumn('SMA 상회여부'),
+                '12M': st.column_config.TextColumn('12개월 수익률'),
+            })
+        for strat, g in merged_df.groupby('전략'):
             buys = g[g['매매액(+매수/-매도)'] > 1000]; sells = g[g['매매액(+매수/-매도)'] < -1000]
             parts = []
             if not buys.empty: parts.append('매수: ' + ', '.join(f"{x.ETF} {w(x['매매액(+매수/-매도)'])}" for _, x in buys.iterrows()))
