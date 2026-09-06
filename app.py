@@ -198,7 +198,7 @@ def load_kr_individual_stocks(asof):
                 page += 1
             if rows_all:
                 out = pd.DataFrame([
-                    {'ticker': re.sub(r'\D', '', str(x.get('srtnCd', ''))), 'name': str(x.get('itmsNm', '')), 'mkt': str(x.get('mrktCtg', ''))}
+                    {'ticker': kr6(str(x.get('srtnCd', ''))), 'name': str(x.get('itmsNm', '')), 'mkt': str(x.get('mrktCtg', ''))}
                     for x in rows_all if x.get('srtnCd')
                 ])
                 out = out[out['ticker'] != '']
@@ -232,7 +232,7 @@ def load_krx_universe(asof, source='krx'):
                 rows = r.json().get('OutBlock_1', [])
                 if rows:
                     etf_df = pd.DataFrame([
-                        {'ticker': re.sub(r'\D', '', str(x.get('ISU_CD', ''))), 'name': str(x.get('ISU_NM', ''))}
+                        {'ticker': kr6(str(x.get('ISU_CD', ''))), 'name': str(x.get('ISU_NM', ''))}
                         for x in rows if x.get('ISU_CD')
                     ])
                     etf_df = etf_df[etf_df['ticker'] != '']
@@ -285,6 +285,13 @@ def search_us_symbols(query):
         return pd.DataFrame(columns=['ticker', 'name', 'exchange'])
 
 # ---------- KRX / data.go 가격 어댑터 ----------
+def kr6(x):
+    """한국 상장코드는 항상 6자리(예: 069500)인데, 어딘가에서 숫자로 한 번이라도 변환되면
+    앞의 0이 사라져 '69500'처럼 5자리가 되고, 그러면 API 응답의 6자리 코드와 절대 매칭이
+    안 돼 '조회는 되는데 이 종목만 안 됨' 현상이 생긴다. 비교/저장 전에 항상 6자리로 맞춘다."""
+    d = re.sub(r'\D', '', str(x))
+    return d.zfill(6) if d else str(x)
+
 def normalize_payload(payload, requested=''):
     if isinstance(payload, dict):
         rows = payload.get('data', payload.get('OutBlock_1', payload.get('response', {}).get('body', {}).get('items', {}).get('item', payload)))
@@ -300,7 +307,7 @@ def normalize_payload(payload, requested=''):
         # 필터링이 항상 "전체 응답"을 반환해 마지막 행(임의의 한 종목) 가격이 모든 티커에 붙는 버그가 생긴다.
         raw_ticker = str(x.get('symbol', x.get('ISU_SRT_CD', x.get('ISU_CD', x.get('srtnCd', x.get('isu_srt_cd', x.get('ticker', requested)))))))
         digits = re.sub(r'\D', '', raw_ticker)
-        ticker = digits if digits else raw_ticker.replace('.KS', '').strip()
+        ticker = kr6(digits) if digits else raw_ticker.replace('.KS', '').strip()
         d = str(x.get('date', x.get('basDd', x.get('BAS_DD', x.get('basDt', x.get('stck_bsop_date', '')))))).replace('-', '')
         close = x.get('close', x.get('TDD_CLSPRC', x.get('clpr', x.get('stck_clpr', x.get('price')))))
         name = x.get('name', x.get('ISU_NM', x.get('itmsNm', '')))
@@ -315,7 +322,7 @@ DATA_GO_STOCK_URL_DEFAULT = 'https://apis.data.go.kr/1160100/service/GetStockSec
 DATA_GO_ETF_URL_DEFAULT = 'https://apis.data.go.kr/1160100/service/GetSecuritiesProductInfoService/getETFPriceInfo'
 
 def fetch_day(source, ticker, day):
-    ticker_norm = re.sub(r'\D', '', str(ticker)) or str(ticker)
+    ticker_norm = kr6(ticker)
     if source == 'krx':
         url, key = secret('KRX_BASE_URL'), secret('KRX_AUTH_KEY')
         if not url or not key: raise RuntimeError('KRX_BASE_URL/KRX_AUTH_KEY 미설정')
@@ -363,7 +370,7 @@ def fetch_monthly(source, ticker, day):
     # 월말 날짜가 정확히 휴장일이면(전체 달의 ~30%가 주말) 그 달을 통째로 건너뛰어 prices가
     # 10개월 미만으로 남고 SMA가 0이 되는 버그가 있었다 — find_trading_day_price로 이미 해결.
     # 여기서는 "이미 지나간 달"의 데이터는 DB 캐시에서 재사용하고, 아직 진행 중인 이번 달만 새로 조회한다.
-    ticker_norm = re.sub(r'\D', '', str(ticker)) or str(ticker)
+    ticker_norm = kr6(ticker)
     dates = pd.date_range(end=pd.Timestamp(day), periods=13, freq='ME')
     cur_month = pd.Timestamp(day).strftime('%Y%m')
     cached = cache_get_prices(ticker_norm)
@@ -386,7 +393,7 @@ def fetch_monthly(source, ticker, day):
 def fetch_daily_recent(source, ticker, day, days=120):
     # 이미 캐시된 날짜는 건너뛰고, 캐시에 없는(주로 지난번 조회 이후 새로 생긴) 거래일만 조회한다.
     # 첫 조회는 예전과 동일하게 느리지만, 두 번째 조회부터는 신규 거래일 수십 개 정도만 불러오면 된다.
-    ticker_norm = re.sub(r'\D', '', str(ticker)) or str(ticker)
+    ticker_norm = kr6(ticker)
     end = pd.Timestamp(day); all_dates = [end - pd.Timedelta(days=i) for i in range(days, -1, -1)]
     all_dates = [d for d in all_dates if d.weekday() < 5]
     cached = cache_get_prices(ticker_norm)
@@ -800,7 +807,7 @@ if page == 'Action Plan':
         st.warning('미국 상장 종목을 보유 중인데 환율(USD/KRW)을 가져오지 못했습니다. 해당 종목 평가액이 0으로 계산될 수 있습니다.')
 
     if st.button('선택일 종가·13개월 월별 데이터 불러오기', type='primary'):
-        ok = 0; errors = []
+        ok = 0; errors = []; failed = []
         for i, a in ap_assets.iterrows():
             t = str(a['ticker']).strip()
             if not t or t == 'CASH': continue
@@ -811,7 +818,7 @@ if page == 'Action Plan':
                 assets.at[i, 'prices'] = hist.sort_values('date')['close'].tolist() if not hist.empty else [row['close']]
                 ok += 1
             except Exception as e:
-                errors.append(f'{t}: {e}')
+                errors.append(f'{t}: {e}'); failed.append(i)
         # ISA(-10%)·SSO(-15% 이상) 트리거 판정용 최근 영업일 고점대비 하락률 (월말 데이터만으론 월중 고점을 놓침)
         trigger_dd = {}
         signal_rows = ap_assets[(ap_assets['strategy'].eq('ISA')) | ((ap_assets['strategy'].eq('SSO')) & (ap_assets['role'].eq('S&P500 기준')))]
@@ -823,9 +830,26 @@ if page == 'Action Plan':
             except Exception as e:
                 errors.append(f'{st_ticker}(트리거): {e}'); trigger_dd[strat] = None
         st.session_state.trigger_dd = trigger_dd
+        st.session_state.failed_tickers = failed
         st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
         st.success(f'{ok}개 종목 반영')
         if errors: st.warning(' / '.join(errors[:8]))
+
+    failed_idx = st.session_state.get('failed_tickers', [])
+    failed_idx = [i for i in failed_idx if i in assets.index]
+    if failed_idx:
+        with st.expander(f'⚠️ 종가 조회 실패 {len(failed_idx)}건 — 수동 입력', expanded=True):
+            st.caption('자동 조회가 안 되는 종목의 종가를 직접 입력하면 현재평가액·목표금액 계산에 반영됩니다. '
+                       '이전에 캐시된 월별 데이터가 남아있다면 SMA·12개월 수익률은 그 데이터로 계속 계산됩니다.')
+            for i in failed_idx:
+                a = assets.loc[i]
+                new_close = st.number_input(f"{a['name']} ({a['ticker']}) 종가", min_value=0.0, step=1.0,
+                                             value=n(a['close']), key=f'manual_close_{i}')
+                if st.button(f"{a['ticker']} 종가 적용", key=f'manual_close_btn_{i}'):
+                    assets.at[i, 'close'] = new_close
+                    st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
+                    st.session_state.failed_tickers = [x for x in failed_idx if x != i]
+                    st.success('반영했습니다.'); st.rerun()
 
     trigger_dd = st.session_state.get('trigger_dd', {})
     rows = []
@@ -988,8 +1012,9 @@ elif page == '포트폴리오 대시보드':
                     st.progress(min(1.0, max(0.0, r['현재비중'] / 100)), text=f"{r['현재비중']:.1f}%")
             else:
                 show = g[['ETF', '현재금액', '현재비중', '목표비중']].copy()
+                show['현재금액'] = show['현재금액'].map(num0)
                 st.dataframe(show, use_container_width=True, hide_index=True, column_config={
-                    '현재금액': st.column_config.NumberColumn('현재금액', format='%d원'),
+                    '현재금액': st.column_config.TextColumn('현재금액(원)'),
                     '현재비중': st.column_config.ProgressColumn('현재비중', format='%.1f%%', min_value=0, max_value=100),
                     '목표비중': st.column_config.NumberColumn('목표비중(%)', format='%.1f%%'),
                 })
@@ -1154,18 +1179,26 @@ elif page == '전략 구성':
         if catalog.empty:
             err = catalog.attrs.get('error', '알 수 없는 이유로 목록을 가져오지 못했습니다.')
             st.warning(f'종목 목록을 가져오지 못했습니다.\n\n{err}\n\nETF는 secrets.toml의 KRX_BASE_URL/KRX_AUTH_KEY(가격 조회와 동일)를, 개별종목은 DATA_GO_SERVICE_KEY(data.go.kr "금융위원회_주식시세정보" 활용신청)를 확인해주세요.')
-        filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False) | catalog['name'].str.contains(q, case=False, na=False)] if q else catalog.head(100)
-        filtered = filtered.sort_values(['name', 'ticker'])
-        opts = ['선택 안 함'] + [f"{r['name']} · {r['ticker']} ({r['type']})" for _, r in filtered.head(200).iterrows()]
-        picked = st.selectbox('검색 결과', opts, key='kr_pick')
-        if st.button('선택 종목을 전략에 추가', key='kr_add') and picked != '선택 안 함':
-            nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
-            assets.loc[len(assets)] = {'id': str(len(assets) + 1), 'strategy': chosen, 'ticker': t, 'name': nm, 'market': 'KR',
-                                        'role': '사용자 추가', 'target_pct': 0.0, 'shares': 0.0, 'close': 0.0, 'prices': [],
-                                        'signal_ticker': t, 'category': '기타'}
-            st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
-            st.success(f'{t} {nm} 추가'); st.rerun()
-        st.caption(f'KRX 목록 {len(catalog):,}개 (ETF는 이미 설정된 KRX_AUTH_KEY로 조회, 개별주식은 pykrx 보강 시도)')
+        if q:
+            filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False) | catalog['name'].str.contains(q, case=False, na=False)]
+            filtered = filtered.sort_values(['name', 'ticker'])
+            shown = filtered.head(20)
+            opts = [f"{r['name']} · {r['ticker']} ({r['type']})" for _, r in shown.iterrows()]
+            if opts:
+                picked = st.radio('검색 결과', opts, key='kr_pick')
+                if len(filtered) > 20: st.caption(f'{len(filtered)}개 중 상위 20개만 표시했습니다. 검색어를 더 구체적으로 입력해보세요.')
+                if st.button('선택 종목을 전략에 추가', key='kr_add'):
+                    nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
+                    assets.loc[len(assets)] = {'id': str(len(assets) + 1), 'strategy': chosen, 'ticker': t, 'name': nm, 'market': 'KR',
+                                                'role': '사용자 추가', 'target_pct': 0.0, 'shares': 0.0, 'close': 0.0, 'prices': [],
+                                                'signal_ticker': t, 'category': '기타'}
+                    st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
+                    st.success(f'{t} {nm} 추가'); st.rerun()
+            else:
+                st.caption('검색 결과가 없습니다.')
+        else:
+            st.caption('티커 또는 종목명을 입력하면 후보가 바로 아래 나타납니다.')
+        st.caption(f'KRX 목록 {len(catalog):,}개 (ETF는 이미 설정된 KRX_AUTH_KEY로 조회, 개별종목은 pykrx 보강 시도)')
     else:
         q = st.text_input('종목명 또는 티커 입력 (예: Apple, AAPL)', key='us_q')
         if st.button('검색', key='us_search') and q:
@@ -1173,9 +1206,9 @@ elif page == '전략 구성':
         results = st.session_state.get('us_results', pd.DataFrame(columns=['ticker', 'name', 'exchange']))
         if not results.empty:
             results = results.sort_values(['name', 'ticker'])
-            opts = ['선택 안 함'] + [f"{r['name']} · {r['ticker']} ({r['exchange']})" for _, r in results.iterrows()]
-            picked = st.selectbox('검색 결과', opts, key='us_pick')
-            if st.button('선택 종목을 전략에 추가', key='us_add') and picked != '선택 안 함':
+            opts = [f"{r['name']} · {r['ticker']} ({r['exchange']})" for _, r in results.iterrows()]
+            picked = st.radio('검색 결과', opts, key='us_pick')
+            if st.button('선택 종목을 전략에 추가', key='us_add'):
                 nm, rest = picked.split(' · ', 1); t = rest.rsplit(' (', 1)[0]
                 assets.loc[len(assets)] = {'id': str(len(assets) + 1), 'strategy': chosen, 'ticker': t, 'name': nm, 'market': 'US',
                                             'role': '사용자 추가', 'target_pct': 0.0, 'shares': 0.0, 'close': 0.0, 'prices': [],
@@ -1195,6 +1228,7 @@ elif page == '전략 구성':
             parsed = edited['상품명'].apply(parse_name_ticker)
             rebuilt = edited.rename(columns={'시장': 'market', '목표비중': 'target_pct', '보유수량': 'shares', '분류': 'category'})
             rebuilt['name'] = [x[0] for x in parsed]; rebuilt['ticker'] = [x[1] for x in parsed]
+            rebuilt['ticker'] = rebuilt.apply(lambda r: kr6(r['ticker']) if r['market'] == 'KR' and r['ticker'] else r['ticker'], axis=1)
             rebuilt = rebuilt[['ticker', 'name', 'market', 'target_pct', 'shares', 'category']].copy()
             rebuilt = rebuilt[~((rebuilt['ticker'].fillna('') == '') & (rebuilt['name'].fillna('') == ''))]
             rebuilt['strategy'] = chosen
@@ -1397,4 +1431,6 @@ else:  # 성과 비교
     cd = st.date_input('거래일', date.today(), key='cd'); ca = st.number_input('금액(입금 + / 출금 -)', step=100000.0, key='ca'); cm = st.text_input('메모', key='cm')
     if st.button('입출금 저장'):
         x = get_state('cashflows'); x.append({'date': cd.isoformat(), 'amount': ca, 'memo': cm}); put_state('cashflows', x); st.success('저장했습니다.')
-    st.dataframe(pd.DataFrame(get_state('cashflows')), use_container_width=True, hide_index=True)
+    cf_df = pd.DataFrame(get_state('cashflows'))
+    if not cf_df.empty: cf_df['amount'] = cf_df['amount'].map(w)
+    st.dataframe(cf_df, use_container_width=True, hide_index=True)
