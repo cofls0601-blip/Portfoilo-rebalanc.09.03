@@ -228,7 +228,7 @@ def load_kr_individual_stocks(asof):
     return empty
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_krx_universe(asof, source='krx'):
+def load_krx_universe(asof):
     """한국 상장 종목(ETF+개별주식) 검색용 카탈로그.
     이전에는 pykrx(비공식 스크래핑 라이브러리)에만 의존했는데, 설치가 안 돼 있거나 실패하면
     아무 안내 없이 빈 목록이 나오는 문제가 있었다. 이제는 가격 조회에 이미 쓰고 있는(즉 이미
@@ -1221,7 +1221,7 @@ elif page == '전략 구성':
             err = catalog.attrs.get('error', '알 수 없는 이유로 목록을 가져오지 못했습니다.')
             st.warning(f'종목 목록을 가져오지 못했습니다.\n\n{err}\n\nETF는 secrets.toml의 KRX_BASE_URL/KRX_AUTH_KEY(가격 조회와 동일)를, 개별종목은 DATA_GO_SERVICE_KEY(data.go.kr "금융위원회_주식시세정보" 활용신청)를 확인해주세요.')
         if q:
-            filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False) | catalog['name'].str.contains(q, case=False, na=False)]
+            filtered = catalog[catalog['ticker'].str.contains(q, case=False, na=False, regex=False) | catalog['name'].str.contains(q, case=False, na=False, regex=False)]
             filtered = filtered.sort_values(['name', 'ticker'])
             shown = filtered.head(20)
             opts = [f"{r['name']} · {r['ticker']} ({r['type']})" for _, r in shown.iterrows()]
