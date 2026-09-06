@@ -603,6 +603,32 @@ def compute_category_breakdown(assets_df, active_only=True):
     out['비중'] = out['금액'] / total * 100 if total > 0 else 0.0
     return out
 
+# 백업/복원에 포함해야 하는 모든 kv 키. 새 상태를 추가할 때마다 여기 한 곳만 늘리면
+# 백업 JSON이 저절로 최신 스키마를 따라가서, "백업엔 있는데 복원엔 빠졌다" 같은 실수를 막는다.
+ALL_KV_KEYS = ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies', 'category_targets']
+
+def export_backup_dict():
+    return {k: get_state(k) for k in ALL_KV_KEYS}
+
+def write_auto_backup():
+    """로컬 실행 중 DB 파일이 손상되거나 실수로 초기화됐을 때를 대비한 보조 안전망.
+    매달 스냅샷을 저장할 때마다 타임스탬프가 찍힌 백업 파일을 별도로 남긴다.
+    (단, 클라우드 배포처럼 컨테이너 자체가 재배포마다 초기화되는 환경에서는 이 파일도 함께
+    사라지므로 근본적인 해결책은 아니고, '코드 업데이트 전 백업 다운로드 → 이후 복원' 절차가 필수다.)"""
+    try:
+        backup_dir = Path.home() / '.asset_allocation_app' / 'backups'
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        data = export_backup_dict()
+        path = backup_dir / f'backup-{date.today().isoformat()}.json'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        files = sorted(backup_dir.glob('backup-*.json'))
+        for old in files[:-30]:
+            try: old.unlink()
+            except Exception: pass
+    except Exception:
+        pass
+
 def save_history_snapshot(assets_df, run_date, plan_text=None):
     """전체 전략의 구성·총액·분류별 총액을 한 번에 히스토리+총자산 시계열에 저장한다."""
     grand, snap_df, _ = compute_portfolio_snapshot(assets_df)
@@ -620,7 +646,17 @@ def save_history_snapshot(assets_df, run_date, plan_text=None):
     put_state('history', h)
     e = [x for x in get_state('equity') if x['date'] != ds]; e.append({'date': ds, 'value': grand})
     put_state('equity', e)
+    write_auto_backup()
     return grand
+
+# 구글 스프레드시트에 매달 정리해 두는 순서. 한 줄(row)로 복사-붙여넣기 하기 위한 순서라
+# 실제로 없는 분류(예: '기타')는 만들지 않는 한 나타나지 않는다.
+CATEGORY_ROW_ORDER = ['현금', '금', '선진국 주식', '신흥국 주식', '선진국 채권', '신흥국 채권']
+
+def build_category_row(date_str, by_category):
+    values = [date_str] + [f'{n(by_category.get(c, 0)):.0f}' for c in CATEGORY_ROW_ORDER]
+    leftover = {k: v for k, v in (by_category or {}).items() if k not in CATEGORY_ROW_ORDER and n(v) != 0}
+    return '\t'.join(values), leftover
 
 def get_category_targets():
     try:
@@ -885,7 +921,7 @@ if page == 'Action Plan':
 
     plan_df = pd.DataFrame(plan_rows)
     st.subheader('이번 달 상태 & 액션플랜')
-    st.caption('종목별 SMA·모멘텀 상태와 그에 따른 매수/매도 액션을 전략 우선순위(LAA→GSM→ISA→SSO→EM) 순으로 한 번에 봅니다.')
+    st.caption('전략 우선순위(LAA→GSM→ISA→SSO→EM) 순으로 전략별 표를 보여줍니다. 매수는 빨간 볼드, 매도는 파란 볼드로 표시됩니다.')
     if plan_df.empty or vdf.empty:
         st.warning('종목 데이터를 먼저 불러오세요.')
     else:
@@ -897,52 +933,37 @@ if page == 'Action Plan':
                 '전략': pr['전략'], '티커': pr['티커'], 'ETF': pr['ETF'],
                 '종가': sig.get('종가'), 'SMA10': sig.get('SMA10'), 'SMA 위': sig.get('SMA 위'), '12M': sig.get('12M'),
                 '현재금액': pr['현재금액'], '목표금액': pr['목표금액'],
-                '매매액(+매수/-매도)': pr['매매액(+매수/-매도)'], '비고': pr['비고'],
+                '매매액': pr['매매액(+매수/-매도)'], '비고': pr['비고'],
             })
         merged_df = pd.DataFrame(merged_rows)
         order = ordered_strategy_codes(cfgs)
-        merged_df['전략'] = pd.Categorical(merged_df['전략'], categories=order, ordered=True)
-        merged_df = merged_df.sort_values('전략')
         for strat in order:
             g = merged_df[merged_df['전략'] == strat]
             if g.empty: continue
-            st.markdown(f'##### {strat}')
-            for _, r in g.iterrows():
-                amt = r['매매액(+매수/-매도)']
-                if amt > 1000:
-                    action = f'+{w(amt)} 매수'; action_html = f'<b style="color:#B23B2E;">{action}</b>'; border = '#B23B2E'; tint = 'rgba(178,59,46,0.08)'
-                elif amt < -1000:
-                    action = f'{w(amt)} 매도'; action_html = f'<b style="color:#2E5F8A;">{action}</b>'; border = '#2E5F8A'; tint = 'rgba(46,95,138,0.08)'
-                else:
-                    action_html = '<b>변동 없음</b>'; border = 'var(--beige-deep)'; tint = 'rgba(122,110,80,0.05)'
-                if r['티커'] == 'CASH':
-                    lines = [f"{num0(r['현재금액'])}원 → {num0(r['목표금액'])}원", action_html, r['비고']]
-                else:
-                    sma_txt = f"<b>SMA10</b> {num0(r['SMA10'])} ({r['SMA 위']})" if r['SMA10'] is not None else '<b>SMA10</b> 데이터부족'
-                    mom_txt = f"<b>12M</b> {p(r['12M'])}" if r['12M'] is not None else '<b>12M</b> —'
-                    lines = [
-                        f"<b>종가</b> {num0(r['종가'])} · {sma_txt}",
-                        mom_txt,
-                        f"{num0(r['현재금액'])}원 → {num0(r['목표금액'])}원",
-                        action_html,
-                        r['비고'],
-                    ]
-                body = '<br>'.join(lines)
-                st.markdown(
-                    f'<div style="border-left:4px solid {border};background:{tint};border-radius:6px;'
-                    f'padding:10px 12px;margin-bottom:8px;">'
-                    f'<div style="font-weight:700;margin-bottom:4px;color:var(--olive-dark);">{r["ETF"]}</div>'
-                    f'<div style="font-size:0.92rem;line-height:1.7;color:var(--ink);">{body}</div></div>',
-                    unsafe_allow_html=True,
-                )
-        for strat in order:
-            g = merged_df[merged_df['전략'] == strat]
-            if g.empty: continue
-            buys = g[g['매매액(+매수/-매도)'] > 1000]; sells = g[g['매매액(+매수/-매도)'] < -1000]
+            st.markdown(f'#### {strat}')
+            show = g.copy()
+            show['SMA10'] = show['SMA10'].apply(lambda x: num0(x) if x is not None else '데이터부족')
+            show['SMA 위'] = show['SMA 위'].fillna('—')
+            show['12M'] = show['12M'].apply(lambda x: p(x) if x is not None else '—')
+            for c in ['종가', '현재금액', '목표금액']:
+                show[c] = show[c].apply(num0)
+            show['매매액'] = g['매매액'].apply(lambda x: f'+{num0(x)}' if x > 1000 else (num0(x) if x < -1000 else '0'))
+            show = show[['티커', 'ETF', '종가', 'SMA10', 'SMA 위', '12M', '현재금액', '목표금액', '매매액', '비고']]
+
+            def color_action(row):
+                styles = [''] * len(row); idx = list(row.index).index('매매액'); v = row['매매액']
+                if v.startswith('+'): styles[idx] = 'color:#B23B2E; font-weight:700;'
+                elif v.startswith('-'): styles[idx] = 'color:#2E5F8A; font-weight:700;'
+                return styles
+
+            st.dataframe(show.style.apply(color_action, axis=1), use_container_width=True, hide_index=True)
+
+            buys = g[g['매매액'] > 1000]; sells = g[g['매매액'] < -1000]
             parts = []
-            if not buys.empty: parts.append('매수: ' + ', '.join(f"{x.ETF} {w(x['매매액(+매수/-매도)'])}" for _, x in buys.iterrows()))
-            if not sells.empty: parts.append('매도: ' + ', '.join(f"{x.ETF} {w(-x['매매액(+매수/-매도)'])}" for _, x in sells.iterrows()))
-            st.markdown(f"**{strat}** — " + (' · '.join(parts) if parts else '거래 없음'))
+            if not buys.empty: parts.append('매수: ' + ', '.join(f"{x.ETF} {w(x['매매액'])}" for _, x in buys.iterrows()))
+            if not sells.empty: parts.append('매도: ' + ', '.join(f"{x.ETF} {w(-x['매매액'])}" for _, x in sells.iterrows()))
+            st.markdown(('**' + ' · '.join(parts) + '**') if parts else '_거래 없음_')
+            st.divider()
 
     if st.button('Action Plan + 전체 스냅샷을 히스토리에 저장'):
         plan_text = ' | '.join(f"{r['전략']} {r['ETF']}: {w(r['매매액(+매수/-매도)'])} ({r['비고']})" for _, r in plan_df.iterrows() if abs(r['매매액(+매수/-매도)']) > 1000) if not plan_df.empty else ''
@@ -1207,6 +1228,14 @@ elif page == '전략 구성':
         if mom:
             arrow = '▲' if mom['total_delta'] >= 0 else '▼'
             st.info(f"직전 저장({mom['prev_date']}) 대비 총자산 {arrow} {w(abs(mom['total_delta']))} ({mom['prev_date']} → {mom['cur_date']})")
+        rec = next((x for x in get_state('history') if x['date'] == hist_date.isoformat()), None)
+        if rec:
+            row, leftover = build_category_row(rec['date'], rec.get('by_category') or {})
+            st.markdown('**구글 스프레드시트에 붙여넣을 한 줄** (날짜, 현금, 금, 선진국주식, 신흥국주식, 선진국채권, 신흥국채권)')
+            st.code(row, language=None)
+            st.caption('복사 버튼을 누르고 시트의 첫 칸에 붙여넣으면 자동으로 열이 나뉩니다.')
+            if leftover:
+                st.warning('행에 포함되지 않은 분류가 있습니다(0원이 아님): ' + ', '.join(f'{k} {w(v)}' for k, v in leftover.items()))
 
 elif page == '리밸런싱 히스토리':
     st.subheader('리밸런싱 히스토리')
@@ -1274,14 +1303,24 @@ elif page == '리밸런싱 히스토리':
                 else:
                     st.info('이 기록은 구성 스냅샷이 없습니다(이전 버전 저장분).')
                 if rec.get('plan'): st.markdown('**저장 시점 Action Plan 메모**'); st.write(rec['plan'])
+                row, leftover = build_category_row(rec['date'], rec.get('by_category') or {})
+                st.markdown('**구글 스프레드시트 붙여넣기용 한 줄**')
+                st.code(row, language=None)
+                if leftover:
+                    st.caption('행에 포함되지 않은 분류: ' + ', '.join(f'{k} {w(v)}' for k, v in leftover.items()))
     st.divider()
     st.markdown('### 백업 · 복원')
     st.caption(f'현재 DB 파일 위치: `{DB_PATH}` — app.py를 다른 폴더로 옮겨도 이 경로는 바뀌지 않습니다.')
+    st.info('⚠️ **app.py를 업데이트(코드 교체·재배포)하기 전에는 항상 먼저 "JSON 백업 다운로드"를 눌러 파일을 저장해두세요.** 업데이트 후 데이터가 비어 있으면 "JSON 백업 파일로 복원"으로 그대로 되살릴 수 있습니다.')
     bc1, bc2 = st.columns(2)
     with bc1:
-        st.download_button('JSON 백업 다운로드', json.dumps({k: get_state(k) for k in ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies']}, ensure_ascii=False, indent=2), file_name='portfolio-backup.json', mime='application/json')
+        st.download_button('JSON 백업 다운로드', json.dumps(export_backup_dict(), ensure_ascii=False, indent=2, default=str), file_name=f'portfolio-backup-{date.today().isoformat()}.json', mime='application/json')
         if h:
             st.download_button('CSV 히스토리(요약)', pd.DataFrame(h).drop(columns=['composition', 'by_strategy', 'by_category'], errors='ignore').to_csv(index=False), file_name='rebalance-history.csv', mime='text/csv')
+        backup_dir = Path.home() / '.asset_allocation_app' / 'backups'
+        auto_files = sorted(backup_dir.glob('backup-*.json')) if backup_dir.exists() else []
+        if auto_files:
+            st.caption(f'매달 스냅샷 저장 시 자동으로도 백업됩니다 (최근 {len(auto_files)}개 보관 중, 최신: {auto_files[-1].name}). 이 파일은 앱이 로컬에서 계속 실행되는 동안만 남아있습니다.')
     with bc2:
         up = st.file_uploader('JSON 백업 파일로 복원', type=['json'], key='restore_upload')
         if up is not None:
@@ -1289,10 +1328,17 @@ elif page == '리밸런싱 히스토리':
             if st.button('이 백업으로 복원', type='primary', key='restore_btn'):
                 try:
                     data = json.loads(up.getvalue().decode('utf-8'))
-                    for k in ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies']:
-                        if k in data: put_state(k, data[k])
+                    restored, skipped = [], []
+                    for k in ALL_KV_KEYS:
+                        if k in data:
+                            put_state(k, data[k]); restored.append(k)
+                        else:
+                            skipped.append(k)
                     st.session_state.pop('assets', None)
-                    st.success('복원했습니다.'); st.rerun()
+                    a_count = len(data.get('assets', [])); s_count = len(data.get('strategies', [])); h_count = len(data.get('history', []))
+                    st.success(f'복원했습니다 — 전략 {s_count}개, 종목 {a_count}개, 히스토리 {h_count}건.')
+                    if skipped: st.caption(f'백업 파일에 없어 건너뛴 항목: {", ".join(skipped)} (이전 버전 백업이면 정상입니다)')
+                    st.rerun()
                 except Exception as e:
                     st.error(f'복원 실패: {e}')
 
