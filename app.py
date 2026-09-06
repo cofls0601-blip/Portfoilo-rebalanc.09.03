@@ -124,9 +124,21 @@ def default_assets():
     return pd.DataFrame(rows)
 
 # ---------- SQLite persistence ----------
+# 이 번호를 올리면(정수 +1) 다음 실행 시 price_cache가 자동으로 통째로 비워진다.
+# 예전 버전의 버그(예: 모든 티커에 같은 종가가 붙던 문제)로 잘못된 값이 이미 캐시에 저장돼 있으면,
+# 이후 로직을 아무리 고쳐도 캐시가 "성공"으로 잘못 응답하며 그 나쁜 값을 계속 돌려주기 때문에
+# 사용자가 매번 수동으로 캐시를 지워야 했다. 이제는 코드 쪽에서 캐시가 이 버전으로 만들어진 게
+# 맞는지 확인하고, 아니면 알아서 지운다.
+PRICE_CACHE_SCHEMA_VERSION = '2'
+
 def init_db():
     con = sqlite3.connect(DB_PATH); con.execute('CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT NOT NULL)')
     con.execute('CREATE TABLE IF NOT EXISTS price_cache(ticker TEXT, date TEXT, close REAL, PRIMARY KEY(ticker, date))')
+    con.execute('CREATE TABLE IF NOT EXISTS cache_meta(k TEXT PRIMARY KEY, v TEXT)')
+    row = con.execute("SELECT v FROM cache_meta WHERE k='schema_version'").fetchone()
+    if row is None or row[0] != PRICE_CACHE_SCHEMA_VERSION:
+        con.execute('DELETE FROM price_cache')
+        con.execute("INSERT OR REPLACE INTO cache_meta(k,v) VALUES('schema_version', ?)", (PRICE_CACHE_SCHEMA_VERSION,))
     for k, v in [
         ('assets', default_assets().to_json(orient='records', force_ascii=False)),
         ('history', '[]'), ('equity', '[]'), ('cashflows', '[]'), ('benchmarks', '[]'),
@@ -161,6 +173,9 @@ def cache_put_prices(ticker, rows):
 
 def cache_clear_prices():
     init_db(); con = sqlite3.connect(DB_PATH); con.execute('DELETE FROM price_cache'); con.commit(); con.close()
+
+def cache_clear_prices_for(ticker):
+    init_db(); con = sqlite3.connect(DB_PATH); con.execute('DELETE FROM price_cache WHERE ticker=?', (kr6(ticker),)); con.commit(); con.close()
 
 # ---------- KRX 종목(ETF+개별주식) 카탈로그 ----------
 
@@ -382,11 +397,12 @@ def fetch_monthly(source, ticker, day):
     for d in dates:
         m = d.strftime('%Y%m')
         if m != cur_month and m in cached_by_month:
-            rows.append(cached_by_month[m])
+            c = cached_by_month[m]
+            rows.append({'date': c['date'], 'close': c['close']})
         else:
             row = find_trading_day_price(source, ticker, d)
             if row:
-                rows.append(row); new_rows.append(row)
+                rows.append({'date': row['date'], 'close': row['close']}); new_rows.append(row)
     if new_rows: cache_put_prices(ticker_norm, new_rows)
     return pd.DataFrame(rows)
 
@@ -815,8 +831,11 @@ if page == 'Action Plan':
             try:
                 daydf = fetch_price_day(mkt, source, t, run_date.isoformat()); row = daydf.iloc[-1]; assets.at[i, 'close'] = row['close']
                 hist = fetch_price_monthly(mkt, source, t, run_date.isoformat())
-                assets.at[i, 'prices'] = hist.sort_values('date')['close'].tolist() if not hist.empty else [row['close']]
+                prices = hist.sort_values('date')['close'].tolist() if not hist.empty else [row['close']]
+                assets.at[i, 'prices'] = prices
                 ok += 1
+                if len(prices) < 10:
+                    errors.append(f"{t}: 월별 데이터가 {len(prices)}개뿐이라 SMA10 계산 불가"); failed.append(i)
             except Exception as e:
                 errors.append(f'{t}: {e}'); failed.append(i)
         # ISA(-10%)·SSO(-15% 이상) 트리거 판정용 최근 영업일 고점대비 하락률 (월말 데이터만으론 월중 고점을 놓침)
@@ -838,18 +857,40 @@ if page == 'Action Plan':
     failed_idx = st.session_state.get('failed_tickers', [])
     failed_idx = [i for i in failed_idx if i in assets.index]
     if failed_idx:
-        with st.expander(f'⚠️ 종가 조회 실패 {len(failed_idx)}건 — 수동 입력', expanded=True):
-            st.caption('자동 조회가 안 되는 종목의 종가를 직접 입력하면 현재평가액·목표금액 계산에 반영됩니다. '
-                       '이전에 캐시된 월별 데이터가 남아있다면 SMA·12개월 수익률은 그 데이터로 계속 계산됩니다.')
+        with st.expander(f'⚠️ 종가 조회 실패/데이터 부족 {len(failed_idx)}건', expanded=True):
+            st.caption('자동 조회가 안 되거나 월별 데이터가 부족한 종목입니다. 예전 버전에서 저장된 캐시가 원인일 수도 있으니, '
+                       '"캐시 지우고 재조회"를 먼저 눌러보고 그래도 안 되면 종가를 직접 입력하세요.')
             for i in failed_idx:
                 a = assets.loc[i]
-                new_close = st.number_input(f"{a['name']} ({a['ticker']}) 종가", min_value=0.0, step=1.0,
-                                             value=n(a['close']), key=f'manual_close_{i}')
-                if st.button(f"{a['ticker']} 종가 적용", key=f'manual_close_btn_{i}'):
-                    assets.at[i, 'close'] = new_close
-                    st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
-                    st.session_state.failed_tickers = [x for x in failed_idx if x != i]
-                    st.success('반영했습니다.'); st.rerun()
+                cc1, cc2 = st.columns([2, 1])
+                with cc1:
+                    new_close = st.number_input(f"{a['name']} ({a['ticker']}) 종가", min_value=0.0, step=1.0,
+                                                 value=n(a['close']), key=f'manual_close_{i}')
+                    if st.button(f"{a['ticker']} 종가 적용", key=f'manual_close_btn_{i}'):
+                        assets.at[i, 'close'] = new_close
+                        st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
+                        st.session_state.failed_tickers = [x for x in failed_idx if x != i]
+                        st.success('반영했습니다.'); st.rerun()
+                with cc2:
+                    st.write('')
+                    if st.button('캐시 지우고 재조회', key=f'retry_cache_{i}'):
+                        cache_clear_prices_for(a['ticker'])
+                        try:
+                            mkt = a['market'] or 'KR'
+                            daydf = fetch_price_day(mkt, source, a['ticker'], run_date.isoformat()); row2 = daydf.iloc[-1]
+                            assets.at[i, 'close'] = row2['close']
+                            hist2 = fetch_price_monthly(mkt, source, a['ticker'], run_date.isoformat())
+                            prices2 = hist2.sort_values('date')['close'].tolist() if not hist2.empty else [row2['close']]
+                            assets.at[i, 'prices'] = prices2
+                            st.session_state.assets = assets; put_state('assets', assets.to_dict('records'))
+                            if len(prices2) >= 10:
+                                st.session_state.failed_tickers = [x for x in failed_idx if x != i]
+                                st.success(f"재조회 성공 ({len(prices2)}개월 확보)")
+                            else:
+                                st.warning(f"재조회는 됐지만 여전히 {len(prices2)}개월뿐입니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f'재조회 실패: {e}')
 
     trigger_dd = st.session_state.get('trigger_dd', {})
     rows = []
