@@ -77,11 +77,11 @@ def clean_records(df):
 # LAA 자산 목표비중 합이 원래 매뉴얼(12.5+12.5+12.5+15.5+25+25=103%)대로면 100%를 넘어 저장이 안 됩니다.
 # 국채 비중을 22%로 맞춰 정확히 100%가 되도록 보정했습니다 — 실제 원하시는 배분과 다르면 전략 구성에서 조정하세요.
 DEFAULT_STRATEGIES = [
-    {'code': 'LAA', 'account': '과세 연금저축', 'description': '변형 LAA — 나스닥/유로스탁스만 10개월 SMA 필터, 이탈 시 현금화. 목표비중 복원은 분기 말에만.', 'dynamic': False, 'active': True},
-    {'code': 'GSM', 'account': '비과세 연금저축', 'description': '글로벌 단순 모멘텀 — SMA 통과 후보 중 12개월 수익률 1위에 80% 투자, 20% 현금. 월 1회 리밸런싱.', 'dynamic': True, 'active': True},
-    {'code': 'ISA', 'account': 'ISA', 'description': '나스닥 레버리지 트리거 — 나스닥100 고점대비 -10% 하락 시 분할매수.', 'dynamic': False, 'active': True},
-    {'code': 'SSO', 'account': '일반계좌 2', 'description': 'S&P500 ETF + 현금성 자산. S&P500 고점대비 -15% 하락 시 현금 절반 투입.', 'dynamic': False, 'active': True},
-    {'code': 'EM', 'account': '일반계좌 1', 'description': '신흥국 분산 장기보유. 리밸런싱은 연 1회 정도만.', 'dynamic': False, 'active': True},
+    {'code': 'LAA', 'account': '과세 연금저축', 'description': '변형 LAA — 나스닥/유로스탁스만 10개월 SMA 필터, 이탈 시 현금화. 목표비중 복원은 분기 말에만.', 'dynamic': False, 'active': True, 'annual_limit': 0.0},
+    {'code': 'GSM', 'account': '비과세 연금저축', 'description': '글로벌 단순 모멘텀 — SMA 통과 후보 중 12개월 수익률 1위에 80% 투자, 20% 현금. 월 1회 리밸런싱.', 'dynamic': True, 'active': True, 'annual_limit': 0.0},
+    {'code': 'ISA', 'account': 'ISA', 'description': '나스닥 레버리지 트리거 — 나스닥100 고점대비 -10% 하락 시 분할매수.', 'dynamic': False, 'active': True, 'annual_limit': 0.0},
+    {'code': 'SSO', 'account': '일반계좌 2', 'description': 'S&P500 ETF + 현금성 자산. S&P500 고점대비 -15% 하락 시 현금 절반 투입.', 'dynamic': False, 'active': True, 'annual_limit': 0.0},
+    {'code': 'EM', 'account': '일반계좌 1', 'description': '신흥국 분산 장기보유. 리밸런싱은 연 1회 정도만.', 'dynamic': False, 'active': True, 'annual_limit': 0.0},
 ]
 KNOWN_STRATEGIES = {'LAA', 'GSM', 'ISA', 'SSO', 'EM'}  # 전용 리밸런싱 규칙이 있는 전략(하드코딩된 룰, 이름 변경 금지)
 STRATEGY_DISPLAY_ORDER = ['LAA', 'GSM', 'ISA', 'SSO', 'EM']  # Action Plan에 보여주는 우선순위
@@ -144,6 +144,7 @@ def init_db():
         ('history', '[]'), ('equity', '[]'), ('cashflows', '[]'), ('benchmarks', '[]'),
         ('strategies', json.dumps(DEFAULT_STRATEGIES, ensure_ascii=False)),
         ('category_targets', json.dumps({c: 0.0 for c in CATEGORY_OPTIONS}, ensure_ascii=False)),
+        ('executions', '[]'),
     ]:
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)', (k, v))
     con.commit(); con.close()
@@ -557,6 +558,7 @@ def get_strategies():
         s = DEFAULT_STRATEGIES
     for c in s:
         if 'active' not in c: c['active'] = True  # 구버전 데이터 호환
+        if 'annual_limit' not in c: c['annual_limit'] = 0.0
     return s
 
 def strategy_codes(active_only=False):
@@ -628,7 +630,7 @@ def compute_category_breakdown(assets_df, active_only=True):
 
 # 백업/복원에 포함해야 하는 모든 kv 키. 새 상태를 추가할 때마다 여기 한 곳만 늘리면
 # 백업 JSON이 저절로 최신 스키마를 따라가서, "백업엔 있는데 복원엔 빠졌다" 같은 실수를 막는다.
-ALL_KV_KEYS = ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies', 'category_targets']
+ALL_KV_KEYS = ['assets', 'history', 'equity', 'cashflows', 'benchmarks', 'strategies', 'category_targets', 'executions']
 
 def export_backup_dict():
     return {k: get_state(k) for k in ALL_KV_KEYS}
@@ -695,6 +697,20 @@ def last_snapshot_info():
     last_date = sorted(h, key=lambda x: x['date'])[-1]['date']
     days = (date.today() - pd.Timestamp(last_date).date()).days
     return last_date, days
+
+def ytd_contribution(strategy_code, year=None):
+    """올해(또는 지정 연도) 해당 전략에 태그된 입금 합계 (출금은 차감)."""
+    year = year or date.today().year
+    cf = get_state('cashflows')
+    total = 0.0
+    for c in cf:
+        if c.get('strategy') != strategy_code: continue
+        try:
+            if pd.Timestamp(c['date']).year != year: continue
+        except Exception:
+            continue
+        total += n(c.get('amount'))
+    return total
 
 def compute_mom_delta():
     """가장 최근 두 번의 히스토리 저장을 비교해 총자산/전략별/분류별 증감을 계산."""
@@ -1030,6 +1046,33 @@ if page == 'Action Plan':
             st.markdown(('**' + ' · '.join(parts) + '**') if parts else '_거래 없음_')
             st.divider()
 
+        action_rows = merged_df[merged_df['매매액'].abs() > 1000]
+        if not action_rows.empty:
+            st.markdown('### ✅ 실행 체크리스트 (계획 대비 실제)')
+            st.caption('실제로 주문을 넣었으면 체크하고, 체결금액이 계획과 다르면 직접 입력하세요. 저장하면 히스토리 세부내역에서 계획 대비 실제를 비교할 수 있습니다.')
+            existing_exec = {(x.get('date'), x.get('strategy'), x.get('ticker')): x for x in get_state('executions') if x.get('date') == run_date.isoformat()}
+            with st.form('exec_checklist_form'):
+                exec_inputs = {}
+                for strat in order:
+                    g2 = action_rows[action_rows['전략'] == strat]
+                    if g2.empty: continue
+                    st.markdown(f'**{strat}**')
+                    for _, r in g2.iterrows():
+                        key = (run_date.isoformat(), r['전략'], r['티커'])
+                        prev = existing_exec.get(key, {})
+                        ec1, ec2 = st.columns([1, 2])
+                        with ec1:
+                            done = st.checkbox(f"{r['ETF']} 실행완료", value=bool(prev.get('done', False)), key=f"exec_done_{r['전략']}_{r['티커']}")
+                        with ec2:
+                            actual = st.number_input(f"{r['ETF']} 실제 체결금액", value=n(prev.get('actual', r['매매액'])), step=1000.0, key=f"exec_actual_{r['전략']}_{r['티커']}")
+                        exec_inputs[key] = {'ETF': r['ETF'], 'planned': float(r['매매액']), 'done': done, 'actual': actual}
+                if st.form_submit_button('체크리스트 저장'):
+                    all_exec = [x for x in get_state('executions') if (x.get('date'), x.get('strategy'), x.get('ticker')) not in exec_inputs]
+                    for (d, strat, t), v in exec_inputs.items():
+                        all_exec.append({'date': d, 'strategy': strat, 'ticker': t, 'ETF': v['ETF'], 'planned': v['planned'], 'done': v['done'], 'actual': v['actual']})
+                    put_state('executions', all_exec)
+                    st.success('체크리스트를 저장했습니다.')
+
     if st.button('Action Plan + 전체 스냅샷을 히스토리에 저장'):
         plan_text = ' | '.join(f"{r['전략']} {r['ETF']}: {w(r['매매액(+매수/-매도)'])} ({r['비고']})" for _, r in plan_df.iterrows() if abs(r['매매액(+매수/-매도)']) > 1000) if not plan_df.empty else ''
         save_history_snapshot(assets, run_date, plan_text=plan_text)
@@ -1110,7 +1153,7 @@ elif page == '전략 구성':
             elif code_clean in codes:
                 st.error('이미 존재하는 전략 코드입니다.')
             else:
-                cfgs.append({'code': code_clean, 'account': new_account.strip() or code_clean, 'description': new_desc.strip(), 'dynamic': new_dynamic, 'active': True})
+                cfgs.append({'code': code_clean, 'account': new_account.strip() or code_clean, 'description': new_desc.strip(), 'dynamic': new_dynamic, 'active': True, 'annual_limit': 0.0})
                 put_state('strategies', cfgs)
                 assets.loc[len(assets)] = {'id': str(len(assets) + 1), 'strategy': code_clean, 'ticker': 'CASH', 'name': '현금',
                                             'market': 'KR', 'role': '대기현금', 'target_pct': 100.0, 'shares': 0.0, 'close': 1.0,
@@ -1158,6 +1201,19 @@ elif page == '전략 구성':
         st.metric('전략 총액 (후보 자산 현재평가액 합)', w(strat_total))
     with cc2:
         edit_desc = st.text_area('전략 설명', value=chosen_cfg.get('description', ''), key=f'desc_{chosen}', height=100)
+
+    with st.expander('💰 연간 납입한도 추적 (연금저축·ISA 등)', expanded=n(chosen_cfg.get('annual_limit', 0)) > 0):
+        edit_limit = st.number_input('연간 납입한도(원, 0=추적 안 함)', min_value=0.0, step=100000.0,
+                                      value=n(chosen_cfg.get('annual_limit', 0)), key=f'limit_{chosen}')
+        if edit_limit > 0:
+            ytd = ytd_contribution(chosen)
+            remain = edit_limit - ytd
+            lc1, lc2, lc3 = st.columns(3)
+            lc1.metric(f'{date.today().year}년 납입액', w(ytd))
+            lc2.metric('한도', w(edit_limit))
+            lc3.metric('잔여한도', w(remain), delta=None if remain >= 0 else '한도 초과')
+            st.progress(min(1.0, max(0.0, ytd / edit_limit)))
+            st.caption('입출금 원장에서 이 전략으로 태그된 입금(성과 비교 페이지)만 합산됩니다.')
 
     disp = pd.DataFrame({
         '시장': subset['market'],
@@ -1287,7 +1343,7 @@ elif page == '전략 구성':
             assets2 = assets[~assets['strategy'].eq(chosen)].copy()
             assets2 = pd.concat([assets2, clean_records(rebuilt)], ignore_index=True)
             st.session_state.assets = assets2; put_state('assets', assets2.to_dict('records'))
-            new_cfg = {'code': chosen, 'account': edit_account.strip() or chosen, 'description': edit_desc.strip(), 'dynamic': edit_dynamic, 'active': chosen_cfg.get('active', True)}
+            new_cfg = {'code': chosen, 'account': edit_account.strip() or chosen, 'description': edit_desc.strip(), 'dynamic': edit_dynamic, 'active': chosen_cfg.get('active', True), 'annual_limit': edit_limit}
             new_cfgs = [new_cfg if c['code'] == chosen else c for c in cfgs]
             if chosen not in [c['code'] for c in cfgs]: new_cfgs.append(new_cfg)
             put_state('strategies', new_cfgs)
@@ -1319,7 +1375,7 @@ elif page == '리밸런싱 히스토리':
         st.info('아직 저장된 히스토리가 없습니다. 전략 구성 페이지 하단 또는 Action Plan 페이지에서 저장하세요.')
     else:
         hdf = pd.DataFrame(h).sort_values('date')
-        tab1, tab2, tab3, tab4 = st.tabs(['전체', '전략별 총액', '분류별 총액', '세부 내역'])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(['전체', '전략별 총액', '분류별 총액', '세부 내역', '연간 리포트'])
         with tab1:
             mom = compute_mom_delta()
             if mom:
@@ -1378,11 +1434,71 @@ elif page == '리밸런싱 히스토리':
                 else:
                     st.info('이 기록은 구성 스냅샷이 없습니다(이전 버전 저장분).')
                 if rec.get('plan'): st.markdown('**저장 시점 Action Plan 메모**'); st.write(rec['plan'])
+                exec_recs = [x for x in get_state('executions') if x.get('date') == rec['date']]
+                if exec_recs:
+                    st.markdown('**계획 대비 실제 실행**')
+                    edf = pd.DataFrame(exec_recs)
+                    edf['차이'] = edf['actual'] - edf['planned']
+                    edf['실행'] = edf['done'].map(lambda x: '✅' if x else '⬜')
+                    for c in ['planned', 'actual', '차이']: edf[c] = edf[c].map(w)
+                    st.dataframe(edf[['strategy', 'ETF', '실행', 'planned', 'actual', '차이']].rename(
+                        columns={'strategy': '전략', 'planned': '계획', 'actual': '실제'}), use_container_width=True, hide_index=True)
                 row, leftover = build_category_row(rec['date'], rec.get('by_category') or {})
                 st.markdown('**구글 스프레드시트 붙여넣기용 한 줄**')
                 st.code(row, language=None)
                 if leftover:
                     st.caption('행에 포함되지 않은 분류: ' + ', '.join(f'{k} {w(v)}' for k, v in leftover.items()))
+        with tab5:
+            st.markdown('#### 연간 결산 리포트')
+            years_avail = sorted({pd.Timestamp(r['date']).year for r in h}, reverse=True)
+            if not years_avail:
+                st.info('히스토리가 없습니다.')
+            else:
+                ry = st.selectbox('연도 선택', years_avail, key='report_year')
+                year_recs = sorted([r for r in h if pd.Timestamp(r['date']).year == ry], key=lambda x: x['date'])
+                if len(year_recs) < 1:
+                    st.info('해당 연도의 저장 기록이 없습니다.')
+                else:
+                    first_rec = year_recs[0]; last_rec = year_recs[-1]
+                    st.caption(f"{first_rec['date']} → {last_rec['date']} ({len(year_recs)}회 저장)")
+                    total_start = n(first_rec.get('total')); total_end = n(last_rec.get('total')); delta = total_end - total_start
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric('연초 총자산', w(total_start)); rc2.metric('연말 총자산', w(total_end), delta=w(delta))
+                    equity_year = [{'date': r['date'], 'value': n(r.get('total'))} for r in year_recs]
+                    mm = portfolio_perf(equity_year)
+                    rc3.metric('기간 중 MDD', p(mm[1]) if mm else '—')
+
+                    cf_year = [c for c in get_state('cashflows') if pd.Timestamp(c['date']).year == ry]
+                    irr_year = calc_xirr(equity_year, cf_year) if cf_year else None
+                    st.metric('연간 IRR', p(irr_year) if irr_year is not None else '(해당 연도 입출금 기록 없음)')
+                    if total_start > 0:
+                        st.caption(f'내 포트폴리오 기간수익률(단순, 입출금 미반영): {p(total_end / total_start - 1)}')
+
+                    st.markdown('##### 전략별 연초 → 연말')
+                    strat_rows = []
+                    for strat_code in sorted(set((first_rec.get('by_strategy') or {}).keys()) | set((last_rec.get('by_strategy') or {}).keys())):
+                        s0 = n((first_rec.get('by_strategy') or {}).get(strat_code, 0)); s1 = n((last_rec.get('by_strategy') or {}).get(strat_code, 0))
+                        strat_rows.append({'전략': strat_code, '연초': w(s0), '연말': w(s1), '증감': w(s1 - s0)})
+                    if strat_rows: st.dataframe(pd.DataFrame(strat_rows), use_container_width=True, hide_index=True)
+
+                    st.markdown('##### 분류별 연초 → 연말')
+                    cat_rows = []
+                    for cat in sorted(set((first_rec.get('by_category') or {}).keys()) | set((last_rec.get('by_category') or {}).keys())):
+                        c0 = n((first_rec.get('by_category') or {}).get(cat, 0)); c1v = n((last_rec.get('by_category') or {}).get(cat, 0))
+                        cat_rows.append({'분류': cat, '연초': w(c0), '연말': w(c1v), '증감': w(c1v - c0)})
+                    if cat_rows: st.dataframe(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True)
+
+                    bmk = get_state('benchmarks')
+                    bmk_rows = []
+                    for name in ['QQQ', 'SPY', 'KOSPI200']:
+                        pts = sorted([b for b in bmk if b['name'] == name and first_rec['date'] <= b['date'] <= last_rec['date']], key=lambda x: x['date'])
+                        if len(pts) >= 2:
+                            bmk_rows.append({'벤치마크': name, '기간수익률': p(pts[-1]['value'] / pts[0]['value'] - 1)})
+                    if bmk_rows:
+                        st.markdown('##### 벤치마크 대비 (같은 기간)')
+                        st.dataframe(pd.DataFrame(bmk_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption('벤치마크 데이터가 없습니다. 성과 비교 페이지에서 "벤치마크 자동 채우기"를 먼저 실행해보세요.')
     st.divider()
     st.markdown('### 백업 · 복원')
     st.caption(f'현재 DB 파일 위치: `{DB_PATH}` — app.py를 다른 폴더로 옮겨도 이 경로는 바뀌지 않습니다.')
@@ -1468,10 +1584,48 @@ else:  # 성과 비교
         for name, vals in series.items():
             mm = portfolio_perf(vals); st.write(f'**{name}** — CAGR {p(mm[0]) if mm else "—"} · MDD {p(mm[1]) if mm else "—"}')
 
+    st.divider(); st.subheader('전략별 벤치마크 비교')
+    h_hist = get_state('history')
+    by_strat_series = {}
+    for rec in sorted(h_hist, key=lambda x: x['date']):
+        for strat, val in (rec.get('by_strategy') or {}).items():
+            by_strat_series.setdefault(strat, []).append({'date': rec['date'], 'value': val})
+    if by_strat_series:
+        avail_strats = sorted(by_strat_series.keys())
+        picked_strats = st.multiselect('비교할 전략 선택', avail_strats, default=avail_strats[:2])
+        if picked_strats:
+            strat_series = {}
+            for strat in picked_strats:
+                vals = sorted(by_strat_series[strat], key=lambda x: x['date'])
+                if vals and vals[0]['value'] > 0:
+                    base2 = vals[0]['value']
+                    strat_series[strat] = [{'date': v['date'], 'value': v['value'] / base2 * 100} for v in vals]
+            combined = dict(strat_series)
+            for name in ['QQQ', 'SPY', 'KOSPI200']:
+                if name in series: combined[name] = series[name]
+            if combined:
+                chart2 = pd.concat([pd.DataFrame(v).assign(date=lambda x: pd.to_datetime(x.date)).set_index('date').rename(columns={'value': k}) for k, v in combined.items()], axis=1).sort_index()
+                st.line_chart(chart2)
+            for strat in picked_strats:
+                vals = sorted(by_strat_series[strat], key=lambda x: x['date'])
+                mm = portfolio_perf(vals)
+                strat_cf = [c for c in cf if c.get('strategy') == strat]
+                irr2 = calc_xirr(vals, strat_cf) if strat_cf else None
+                st.write(f"**{strat}** — CAGR {p(mm[0]) if mm else '—'} · MDD {p(mm[1]) if mm else '—'} · IRR {p(irr2) if irr2 is not None else '(태그된 입출금 없음)'}")
+    else:
+        st.caption('히스토리에 저장된 전략별 데이터가 아직 없습니다 (전략 구성 페이지에서 스냅샷을 저장하면 쌓입니다).')
+
     st.divider(); st.subheader('입출금 원장')
-    cd = st.date_input('거래일', date.today(), key='cd'); ca = st.number_input('금액(입금 + / 출금 -)', step=100000.0, key='ca'); cm = st.text_input('메모', key='cm')
+    st.caption('전략(계좌)을 지정하면 연금저축/ISA 납입한도 추적과 전략별 벤치마크 비교에 쓰입니다. 지정하지 않으면 전체 포트폴리오 성과 계산에만 반영됩니다.')
+    cf_codes = ['(지정 안 함)'] + strategy_codes()
+    cd = st.date_input('거래일', date.today(), key='cd'); ca = st.number_input('금액(입금 + / 출금 -)', step=100000.0, key='ca')
+    cstrat = st.selectbox('전략(계좌)', cf_codes, key='cstrat'); cm = st.text_input('메모', key='cm')
     if st.button('입출금 저장'):
-        x = get_state('cashflows'); x.append({'date': cd.isoformat(), 'amount': ca, 'memo': cm}); put_state('cashflows', x); st.success('저장했습니다.')
+        x = get_state('cashflows')
+        x.append({'date': cd.isoformat(), 'amount': ca, 'memo': cm, 'strategy': '' if cstrat == '(지정 안 함)' else cstrat})
+        put_state('cashflows', x); st.success('저장했습니다.')
     cf_df = pd.DataFrame(get_state('cashflows'))
-    if not cf_df.empty: cf_df['amount'] = cf_df['amount'].map(w)
+    if not cf_df.empty:
+        if 'strategy' not in cf_df: cf_df['strategy'] = ''
+        cf_df['amount'] = cf_df['amount'].map(w)
     st.dataframe(cf_df, use_container_width=True, hide_index=True)
